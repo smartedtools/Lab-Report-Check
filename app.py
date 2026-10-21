@@ -841,7 +841,7 @@ elif portal_mode == "Instructor / Admin Login":
                 st.info("No courses assigned to your account yet. Please create a course in Tab 1.")
 
         # ==========================================
-        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC CSV UPLOAD
+        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC BUILDER
         # ==========================================
         with tab3:
             st.subheader("Manage Experiments, Combined Packets & Design Reports")
@@ -855,7 +855,7 @@ elif portal_mode == "Instructor / Admin Login":
                 with col_e1:
                     exp_no = st.number_input("Assessment Number / ID", min_value=1, step=1)
                 with col_e2:
-                    exp_title = st.text_input("Assessment Title (e.g., Exp 1: pH & Turbidity or Labs 1-6 Combined)").strip()
+                    exp_title = st.text_input("Assessment Title * (e.g., Exp 1: pH or Labs 1-6)").strip()
                 
                 is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Packet or Design Report?", value=False)
                 is_open = st.checkbox("🔓 Accepting Submissions (Open)", value=True)
@@ -872,7 +872,7 @@ elif portal_mode == "Instructor / Admin Login":
                     col_r_dl, col_r_up = st.columns([1, 2])
                     with col_r_dl:
                         st.download_button(
-                            label="📥 Download Sample Likert Rubric CSV Template",
+                            label="📥 Download Sample Likert CSV",
                             data=SAMPLE_RUBRIC_CSV_BYTES,
                             file_name="custom_likert_rubric_template.csv",
                             mime="text/csv",
@@ -888,15 +888,16 @@ elif portal_mode == "Instructor / Admin Login":
                     if uploaded_exp_rubric_file is not None:
                         try:
                             default_custom_rubric_df = parse_uploaded_rubric_file(uploaded_exp_rubric_file)
-                            st.success(f"✅ Loaded {len(default_custom_rubric_df)} custom criteria from `{uploaded_exp_rubric_file.name}`!")
+                            st.success(f"✅ Loaded {len(default_custom_rubric_df)} criteria from file!")
                         except Exception as e:
-                            st.error(f"Error reading uploaded rubric file: {e}")
+                            st.error(f"Error reading file: {e}")
                             default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
                     else:
                         template_choice = st.radio(
-                            "Or choose a starting template to edit manually:",
-                            ["5-Criterion Engineering Design Rubric (20 Marks)", "10-Criterion Standard Lab Rubric (40 Marks)"],
-                            horizontal=True
+                            "Choose starting template:",
+                            ["5-Criterion Design Rubric (20 Marks)", "10-Criterion Lab Rubric (40 Marks)"],
+                            horizontal=True,
+                            key="exp_template_radio"
                         )
                         if "10-Criterion" in template_choice:
                             default_custom_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
@@ -918,15 +919,16 @@ elif portal_mode == "Instructor / Admin Login":
                         key="exp_custom_rubric_editor"
                     )
                 
-                if st.button("💾 Create / Update Assessment", type="primary"):
+                # Button placed cleanly outside any broken form wrapper
+                if st.button("💾 Create / Update Assessment", type="primary", key="btn_save_assessment"):
                     if not exp_title:
-                        st.error("Please enter an Assessment Title.")
+                        st.error("❌ Assessment Title is required! Please enter a title above before saving.")
                     else:
                         custom_json = None
                         if use_custom_rubric and edited_exp_rubric is not None:
                             custom_json, custom_total = build_rubric_from_df(edited_exp_rubric)
                             if not custom_json:
-                                st.error("Please provide at least one valid custom rubric criterion with marks > 0.")
+                                st.error("❌ Please provide at least one valid custom rubric criterion with marks > 0.")
                                 st.stop()
                         
                         try:
@@ -940,9 +942,10 @@ elif portal_mode == "Instructor / Admin Login":
                                 "custom_rubric_json": custom_json
                             }, on_conflict="course_id, exp_number").execute()
                             st.success(f"✅ Assessment #{exp_no} (`{exp_title}`) saved successfully!")
+                            time.sleep(1)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Error saving assessment: {e}")
+                            st.error(f"❌ Database error saving assessment: {e}")
             else:
                 st.info("Please set up a course first in Tab 1.")
 
