@@ -185,7 +185,7 @@ DEFAULT_DESIGN_LIKERT_RUBRIC = [
 ]
 
 # ==========================================
-# HELPER FUNCTIONS: AUTH, DRIVE & GEMINI
+# HELPER FUNCTIONS: AUTH, RUBRIC CSV, DRIVE & GEMINI
 # ==========================================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
@@ -205,13 +205,55 @@ def ensure_default_admin():
     except Exception:
         pass
 
+def parse_uploaded_rubric_file(uploaded_file):
+    """Reads an uploaded CSV or Excel rubric file and normalizes column headers."""
+    if uploaded_file.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+        
+    # Map flexible header names to standard internal column keys
+    col_mapping = {}
+    for col in df.columns:
+        c_low = str(col).strip().lower()
+        if "crit" in c_low or "head" in c_low or "title" in c_low:
+            col_mapping[col] = "criterion"
+        elif "mark" in c_low or "weight" in c_low or "score" in c_low:
+            col_mapping[col] = "max_marks"
+        elif "4" in c_low or "excel" in c_low:
+            col_mapping[col] = "level_4"
+        elif "3" in c_low or "prof" in c_low:
+            col_mapping[col] = "level_3"
+        elif "2" in c_low or "dev" in c_low:
+            col_mapping[col] = "level_2"
+        elif "1" in c_low or "need" in c_low or "improv" in c_low:
+            col_mapping[col] = "level_1"
+            
+    df = df.rename(columns=col_mapping)
+    
+    if "criterion" not in df.columns:
+        raise ValueError("Uploaded file must contain a 'criterion' (or 'Evaluation Criteria') column.")
+        
+    if "max_marks" not in df.columns:
+        df["max_marks"] = 4.0
+    if "level_4" not in df.columns:
+        df["level_4"] = "Excellent performance; meets all requirements."
+    if "level_3" not in df.columns:
+        df["level_3"] = "Proficient performance; minor omissions or errors."
+    if "level_2" not in df.columns:
+        df["level_2"] = "Developing performance; major omissions or errors."
+    if "level_1" not in df.columns:
+        df["level_1"] = "Needs improvement or missing entirely."
+        
+    return df[["criterion", "max_marks", "level_4", "level_3", "level_2", "level_1"]]
+
 def build_rubric_from_df(df_rubric: pd.DataFrame):
     """Validates an editable Likert rubric dataframe and computes weight percentages & total marks."""
     valid_rows = []
     for _, row in df_rubric.iterrows():
         crit = str(row.get("criterion", "")).strip()
         marks = row.get("max_marks", 4.0)
-        if crit and pd.notna(marks) and float(marks) > 0:
+        if crit and crit.lower() != "nan" and pd.notna(marks) and float(marks) > 0:
             valid_rows.append({
                 "criterion": crit,
                 "max_marks": float(marks),
@@ -373,6 +415,9 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
 # Ensure default admin exists
 ensure_default_admin()
 
+# Shared Sample Rubric CSV bytes for template downloads
+SAMPLE_RUBRIC_CSV_BYTES = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC).to_csv(index=False).encode("utf-8")
+
 # ==========================================
 # SIDEBAR NAVIGATION
 # ==========================================
@@ -437,7 +482,6 @@ if portal_mode == "Student Submission Portal":
                 selected_exp_label = st.selectbox("Select Assessment", list(exp_options.keys()))
                 exp = exp_options[selected_exp_label]
                 
-                # Show the Likert Scale Grading Rubric to the student so they know how marks are awarded
                 student_active_rubric = exp['custom_rubric_json'] if exp.get('custom_rubric_json') else selected_course_obj['rubric_json']
                 if student_active_rubric:
                     with st.expander("📋 View Grading Rubric & Likert Scale Criteria (4 = Excellent to 1 = Needs Improvement)"):
@@ -632,16 +676,39 @@ elif portal_mode == "Instructor / Admin Login":
                     st.dataframe(pd.DataFrame(all_users), use_container_width=True)
 
         # ==========================================
-        # TAB 1: COURSE SETUP WITH 4-POINT LIKERT RUBRIC MATRIX
+        # TAB 1: COURSE SETUP WITH LIKERT RUBRIC MATRIX & CSV UPLOAD
         # ==========================================
         with tab1:
             st.subheader("Configure Course & 4-Point Likert Scale Rubric")
             st.markdown(
-                "Pre-loaded below is your **10-Criterion Likert Scale Lab Rubric** (`4 – Excellent`, `3 – Proficient`, `2 – Developing`, `1 – Needs Improvement`). "
-                "You can edit any cell, add/remove rows, or adjust `Max Marks` per criterion."
+                "You can either use/edit the pre-loaded **10-Criterion Likert Scale Lab Rubric** below, or **upload your own Rubric CSV/Excel file**."
             )
             
-            default_course_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
+            col_t1_dl, col_t1_up = st.columns([1, 2])
+            with col_t1_dl:
+                st.download_button(
+                    label="📥 Download Sample Likert Rubric CSV Template",
+                    data=SAMPLE_RUBRIC_CSV_BYTES,
+                    file_name="likert_rubric_template.csv",
+                    mime="text/csv",
+                    key="dl_course_rubric_template"
+                )
+            with col_t1_up:
+                uploaded_course_rubric_file = st.file_uploader(
+                    "Optional: Upload Course Rubric CSV / Excel (.csv, .xlsx)",
+                    type=["csv", "xlsx"],
+                    key="course_rubric_csv_uploader"
+                )
+                
+            if uploaded_course_rubric_file is not None:
+                try:
+                    default_course_rubric_df = parse_uploaded_rubric_file(uploaded_course_rubric_file)
+                    st.success(f"✅ Loaded {len(default_course_rubric_df)} criteria from `{uploaded_course_rubric_file.name}` into the editor below!")
+                except Exception as e:
+                    st.error(f"Error reading uploaded rubric file: {e}")
+                    default_course_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
+            else:
+                default_course_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
             
             with st.form("course_form"):
                 col_c1, col_c2 = st.columns(2)
@@ -774,7 +841,7 @@ elif portal_mode == "Instructor / Admin Login":
                 st.info("No courses assigned to your account yet. Please create a course in Tab 1.")
 
         # ==========================================
-        # TAB 3: ASSESSMENTS & CUSTOM LIKERT RUBRIC BUILDER
+        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC CSV UPLOAD
         # ==========================================
         with tab3:
             st.subheader("Manage Experiments, Combined Packets & Design Reports")
@@ -784,32 +851,58 @@ elif portal_mode == "Instructor / Admin Login":
                 selected_c_code = st.selectbox("Select Course", list(c_dict.keys()), key="exp_course_select")
                 course_data = c_dict[selected_c_code]
                 
-                template_choice = st.radio(
-                    "Select Custom Rubric Starting Template (if overriding Course Default):",
-                    ["10-Criterion Standard Lab Rubric (40 Marks)", "5-Criterion Engineering Design Rubric (20 Marks)"],
-                    horizontal=True
-                )
+                col_e1, col_e2 = st.columns([1, 3])
+                with col_e1:
+                    exp_no = st.number_input("Assessment Number / ID", min_value=1, step=1)
+                with col_e2:
+                    exp_title = st.text_input("Assessment Title (e.g., Exp 1: pH & Turbidity or Labs 1-6 Combined)").strip()
                 
-                if "10-Criterion" in template_choice:
-                    default_custom_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
+                is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Packet or Design Report?", value=False)
+                is_open = st.checkbox("🔓 Accepting Submissions (Open)", value=True)
+                exp_guidelines = st.text_area("Optional Guidelines for AI Evaluator", placeholder="e.g., Verify mass balance equations and APHA standard compliance.")
+                
+                st.markdown("---")
+                use_custom_rubric = st.checkbox("✨ Use Custom Likert Rubric for this Assessment (Overrides Course Default Rubric)", value=False)
+                
+                edited_exp_rubric = None
+                if not use_custom_rubric:
+                    st.info("ℹ️ This assessment will automatically use the **Course Default Likert Rubric** configured in Tab 1.")
                 else:
-                    default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
-                
-                with st.form("exp_form"):
-                    col_e1, col_e2 = st.columns([1, 3])
-                    with col_e1:
-                        exp_no = st.number_input("Assessment Number / ID", min_value=1, step=1)
-                    with col_e2:
-                        exp_title = st.text_input("Assessment Title (e.g., Exp 1: pH & Turbidity or Labs 1-6 Combined)").strip()
-                    
-                    is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Packet or Design Report?", value=False)
-                    is_open = st.checkbox("🔓 Accepting Submissions (Open)", value=True)
-                    exp_guidelines = st.text_area("Optional Guidelines for AI Evaluator", placeholder="e.g., Verify mass balance equations and APHA standard compliance.")
-                    
-                    st.markdown("---")
-                    use_custom_rubric = st.checkbox("✨ Use Custom Likert Rubric for this Assessment (Overrides Course Default Rubric)", value=False)
-                    st.caption("If checked, the 4-point Likert table below will be used for this specific assessment. If unchecked, the Course Default Rubric will be used.")
-                    
+                    st.markdown("#### Custom Likert Rubric Setup (Upload CSV/Excel or Edit Below)")
+                    col_r_dl, col_r_up = st.columns([1, 2])
+                    with col_r_dl:
+                        st.download_button(
+                            label="📥 Download Sample Likert Rubric CSV Template",
+                            data=SAMPLE_RUBRIC_CSV_BYTES,
+                            file_name="custom_likert_rubric_template.csv",
+                            mime="text/csv",
+                            key="dl_exp_rubric_template"
+                        )
+                    with col_r_up:
+                        uploaded_exp_rubric_file = st.file_uploader(
+                            "Upload Your Custom Rubric File (.csv or .xlsx)",
+                            type=["csv", "xlsx"],
+                            key="exp_rubric_csv_uploader"
+                        )
+                        
+                    if uploaded_exp_rubric_file is not None:
+                        try:
+                            default_custom_rubric_df = parse_uploaded_rubric_file(uploaded_exp_rubric_file)
+                            st.success(f"✅ Loaded {len(default_custom_rubric_df)} custom criteria from `{uploaded_exp_rubric_file.name}`!")
+                        except Exception as e:
+                            st.error(f"Error reading uploaded rubric file: {e}")
+                            default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
+                    else:
+                        template_choice = st.radio(
+                            "Or choose a starting template to edit manually:",
+                            ["5-Criterion Engineering Design Rubric (20 Marks)", "10-Criterion Standard Lab Rubric (40 Marks)"],
+                            horizontal=True
+                        )
+                        if "10-Criterion" in template_choice:
+                            default_custom_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
+                        else:
+                            default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
+                            
                     edited_exp_rubric = st.data_editor(
                         default_custom_rubric_df,
                         column_config={
@@ -824,33 +917,32 @@ elif portal_mode == "Instructor / Admin Login":
                         use_container_width=True,
                         key="exp_custom_rubric_editor"
                     )
-                    
-                    submitted_exp = st.form_submit_button("💾 Create / Update Assessment")
-                    if submitted_exp:
-                        if not exp_title:
-                            st.error("Please enter an Assessment Title.")
-                        else:
-                            custom_json = None
-                            if use_custom_rubric:
-                                custom_json, custom_total = build_rubric_from_df(edited_exp_rubric)
-                                if not custom_json:
-                                    st.error("Please provide at least one valid custom rubric criterion with marks > 0.")
-                                    st.stop()
-                            
-                            try:
-                                supabase.table("experiments").upsert({
-                                    "course_id": course_data['course_id'],
-                                    "exp_number": exp_no,
-                                    "exp_title": exp_title,
-                                    "exp_guidelines": exp_guidelines,
-                                    "is_open": is_open,
-                                    "is_combined": is_combined,
-                                    "custom_rubric_json": custom_json
-                                }, on_conflict="course_id, exp_number").execute()
-                                st.success(f"✅ Assessment #{exp_no} (`{exp_title}`) saved successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error saving assessment: {e}")
+                
+                if st.button("💾 Create / Update Assessment", type="primary"):
+                    if not exp_title:
+                        st.error("Please enter an Assessment Title.")
+                    else:
+                        custom_json = None
+                        if use_custom_rubric and edited_exp_rubric is not None:
+                            custom_json, custom_total = build_rubric_from_df(edited_exp_rubric)
+                            if not custom_json:
+                                st.error("Please provide at least one valid custom rubric criterion with marks > 0.")
+                                st.stop()
+                        
+                        try:
+                            supabase.table("experiments").upsert({
+                                "course_id": course_data['course_id'],
+                                "exp_number": exp_no,
+                                "exp_title": exp_title,
+                                "exp_guidelines": exp_guidelines,
+                                "is_open": is_open,
+                                "is_combined": is_combined,
+                                "custom_rubric_json": custom_json
+                            }, on_conflict="course_id, exp_number").execute()
+                            st.success(f"✅ Assessment #{exp_no} (`{exp_title}`) saved successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error saving assessment: {e}")
             else:
                 st.info("Please set up a course first in Tab 1.")
 
@@ -966,7 +1058,6 @@ elif portal_mode == "Instructor / Admin Login":
                                         r_label = str(c_obj.get('rating_label', f"{likert_val} / 4"))
                                         c_fb = str(c_obj.get('feedback', ''))
                                         
-                                        # Find matched rubric descriptor text for student clarity
                                         r_def = rubric_lookup.get(raw_c_name.lower(), {})
                                         matched_desc = r_def.get(f"level_{likert_val}", "")
                                         
