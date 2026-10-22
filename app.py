@@ -652,7 +652,6 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
                         st.markdown(f"**{type_badge}**")
                         st.markdown(f"### {poll['question_text']}")
                         
-                        # Check if student has already submitted (Strict 1-submission lock)
                         existing_vote = supabase.table("poll_responses").select("*").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
                         
                         if existing_vote:
@@ -677,7 +676,6 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
                                     if not choice:
                                         st.error("Please enter or select a response before submitting.")
                                     else:
-                                        # Double-check in database before inserting to prevent race-condition duplicates
                                         recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
                                         if recheck:
                                             st.warning("Your response was already recorded.")
@@ -772,71 +770,93 @@ elif portal_mode == "Instructor / Admin Login":
             else:
                 return supabase.table("courses").select("*").eq("teacher_username", current_user["username"]).execute().data
 
+        # ==========================================
+        # MULTI-ROW NAVIGATION BUTTON LAYOUT (3 per row)
+        # ==========================================
         if is_admin:
-            tab_admin, tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "🛡️ Manage Teachers (Admin)", 
-                "📚 Course & Likert Rubric", 
-                "👥 Class Roster Upload", 
-                "🔬 Assessments & Custom Rubrics", 
+            nav_options = [
+                "🛡️ Manage Teachers", 
+                "📚 Course & Rubric", 
+                "👥 Class Roster", 
+                "🔬 Assessments", 
                 "📊 Grading & Export",
-                "🎯 Live Polls & Quizzes (Menti)"
-            ])
+                "🎯 Live Polls & Quizzes"
+            ]
         else:
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
-                "📚 Course & Likert Rubric", 
-                "👥 Class Roster Upload", 
-                "🔬 Assessments & Custom Rubrics", 
+            nav_options = [
+                "📚 Course & Rubric", 
+                "👥 Class Roster", 
+                "🔬 Assessments", 
                 "📊 Grading & Export",
-                "🎯 Live Polls & Quizzes (Menti)"
-            ])
+                "🎯 Live Polls & Quizzes"
+            ]
             
-        # ==========================================
-        # ADMIN-ONLY TAB: MANAGE TEACHER ACCOUNTS
-        # ==========================================
-        if is_admin:
-            with tab_admin:
-                st.subheader("🛡️ Create or Update Teacher / Admin Accounts")
-                st.markdown("Only Administrators can create or reset login credentials for faculty members.")
-                
-                with st.form("create_user_form"):
-                    col_u1, col_u2 = st.columns(2)
-                    with col_u1:
-                        new_fullname = st.text_input("Teacher Full Name (e.g., Dr. Ahmad Khan)").strip()
-                        new_username = st.text_input("Username (e.g., ahmad.khan)").strip().lower()
-                    with col_u2:
-                        new_password = st.text_input("Set Initial / Reset Password", type="password")
-                        new_role = st.selectbox("Account Role", ["teacher", "admin"])
+        if "faculty_nav_choice" not in st.session_state or st.session_state["faculty_nav_choice"] not in nav_options:
+            st.session_state["faculty_nav_choice"] = nav_options[0]
+
+        st.markdown("---")
+        
+        # Render buttons in clean rows of 3
+        chunked_options = [nav_options[i:i + 3] for i in range(0, len(nav_options), 3)]
+        for row in chunked_options:
+            cols = st.columns(3)
+            for idx, opt in enumerate(row):
+                with cols[idx]:
+                    is_selected = (st.session_state["faculty_nav_choice"] == opt)
+                    btn_type = "primary" if is_selected else "secondary"
+                    if st.button(opt, use_container_width=True, type=btn_type):
+                        st.session_state["faculty_nav_choice"] = opt
+                        st.rerun()
                         
-                    is_active_user = st.checkbox("Account Active", value=True)
-                    save_user_btn = st.form_submit_button("➕ Create / Update User Account")
-                    
-                    if save_user_btn:
-                        if not new_fullname or not new_username or not new_password:
-                            st.error("Please fill in Full Name, Username, and Password.")
-                        else:
-                            try:
-                                supabase.table("app_users").upsert({
-                                    "username": new_username,
-                                    "full_name": new_fullname,
-                                    "password_hash": hash_password(new_password),
-                                    "role": new_role,
-                                    "is_active": is_active_user
-                                }, on_conflict="username").execute()
-                                st.success(f"User account `{new_username}` ({new_role}) saved successfully!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error saving user: {e}")
-                                
-                st.markdown("---")
-                st.subheader("Registered Faculty & Admin Accounts")
-                all_users = supabase.table("app_users").select("username, full_name, role, is_active, created_at").order("created_at").execute().data
-                if all_users:
-                    st.dataframe(pd.DataFrame(all_users), use_container_width=True)
+        st.markdown("---")
+        chosen_tab = st.session_state["faculty_nav_choice"]
 
         # ==========================================
-        # TAB 1: COURSE SETUP WITH LIKERT RUBRIC MATRIX & CSV UPLOAD
+        # SECTION 1: MANAGE TEACHERS (ADMIN ONLY)
         # ==========================================
-        with tab1:
+        if chosen_tab == "🛡️ Manage Teachers":
+            st.subheader("🛡️ Create or Update Teacher / Admin Accounts")
+            st.markdown("Only Administrators can create or reset login credentials for faculty members.")
+            
+            with st.form("create_user_form"):
+                col_u1, col_u2 = st.columns(2)
+                with col_u1:
+                    new_fullname = st.text_input("Teacher Full Name (e.g., Dr. Ahmad Khan)").strip()
+                    new_username = st.text_input("Username (e.g., ahmad.khan)").strip().lower()
+                with col_u2:
+                    new_password = st.text_input("Set Initial / Reset Password", type="password")
+                    new_role = st.selectbox("Account Role", ["teacher", "admin"])
+                    
+                is_active_user = st.checkbox("Account Active", value=True)
+                save_user_btn = st.form_submit_button("➕ Create / Update User Account")
+                
+                if save_user_btn:
+                    if not new_fullname or not new_username or not new_password:
+                        st.error("Please fill in Full Name, Username, and Password.")
+                    else:
+                        try:
+                            supabase.table("app_users").upsert({
+                                "username": new_username,
+                                "full_name": new_fullname,
+                                "password_hash": hash_password(new_password),
+                                "role": new_role,
+                                "is_active": is_active_user
+                            }, on_conflict="username").execute()
+                            st.success(f"User account `{new_username}` ({new_role}) saved successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error saving user: {e}")
+                            
+            st.markdown("---")
+            st.subheader("Registered Faculty & Admin Accounts")
+            all_users = supabase.table("app_users").select("username, full_name, role, is_active, created_at").order("created_at").execute().data
+            if all_users:
+                st.dataframe(pd.DataFrame(all_users), use_container_width=True)
+
+        # ==========================================
+        # SECTION 2: COURSE & LIKERT RUBRIC
+        # ==========================================
+        elif chosen_tab == "📚 Course & Rubric":
             st.subheader("Configure Course & 4-Point Likert Scale Rubric")
             st.markdown(
                 "You can either use/edit the pre-loaded **10-Criterion Likert Scale Lab Rubric** below, or **upload your own Rubric CSV/Excel file**."
@@ -930,9 +950,9 @@ elif portal_mode == "Instructor / Admin Login":
                         st.dataframe(format_rubric_for_display(c['rubric_json']), use_container_width=True, hide_index=True)
 
         # ==========================================
-        # TAB 2: CLASS ROSTER UPLOAD & STUDENT EDITOR
+        # SECTION 3: CLASS ROSTER UPLOAD & STUDENT EDITOR
         # ==========================================
-        with tab2:
+        elif chosen_tab == "👥 Class Roster":
             st.subheader("Upload & Manage Class Roster (CSV / Excel)")
             st.markdown("Upload a spreadsheet containing your student class list. The file must include these exact column headers: **`reg_no`**, **`student_name`**, and **`email`**.")
             
@@ -1011,10 +1031,8 @@ elif portal_mode == "Instructor / Admin Login":
                         with col_btn_up:
                             if st.button("💾 Save Student Changes", key="btn_upd_stu"):
                                 try:
-                                    # Check if another student row already has the target reg_no
                                     clash = supabase.table("students").select("student_id").eq("course_id", selected_course_id).eq("reg_no", new_s_reg).neq("student_id", sel_stu["student_id"]).execute().data
                                     if clash:
-                                        # Remove the duplicate row first so update succeeds cleanly
                                         supabase.table("students").delete().eq("student_id", clash[0]["student_id"]).execute()
                                     supabase.table("students").update({
                                         "reg_no": new_s_reg,
@@ -1033,12 +1051,12 @@ elif portal_mode == "Instructor / Admin Login":
                 else:
                     st.info("No students uploaded for this course yet.")
             else:
-                st.info("No courses assigned to your account yet. Please create a course in Tab 1.")
+                st.info("No courses assigned to your account yet. Please create a course first.")
 
         # ==========================================
-        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC CSV UPLOAD
+        # SECTION 4: ASSESSMENTS & CUSTOM RUBRICS
         # ==========================================
-        with tab3:
+        elif chosen_tab == "🔬 Assessments":
             st.subheader("Manage Experiments, Combined Packets & Design Reports")
             my_courses = get_accessible_courses()
             if my_courses:
@@ -1141,12 +1159,12 @@ elif portal_mode == "Instructor / Admin Login":
                         except Exception as e:
                             st.error(f"Error saving assessment: {e}")
             else:
-                st.info("Please set up a course first in Tab 1.")
+                st.info("Please set up a course first.")
 
         # ==========================================
-        # TAB 4: GRADING & EXPORT (WITH LIKERT BREAKDOWN)
+        # SECTION 5: GRADING & EXPORT
         # ==========================================
-        with tab4:
+        elif chosen_tab == "📊 Grading & Export":
             st.subheader("Batch AI Grading Engine & Likert Scale Gradebook")
             my_courses = get_accessible_courses()
             
@@ -1360,17 +1378,17 @@ elif portal_mode == "Instructor / Admin Login":
                 else:
                     st.info("No assessments created for this course yet.")
             else:
-                st.info("Please set up a course first in Tab 1.")
+                st.info("Please set up a course first.")
 
         # ==========================================
-        # TAB 5: LIVE POLLS, WORD CLOUDS & GRADED QUIZZES (MENTIMETER)
+        # SECTION 6: LIVE POLLS & QUIZZES (MENTI)
         # ==========================================
-        with tab5:
+        elif chosen_tab == "🎯 Live Polls & Quizzes":
             st.subheader("🎯 Live Classroom Polls, Word Clouds & Graded Quizzes")
             my_courses = get_accessible_courses()
             
             if not my_courses:
-                st.info("Please create a course in Tab 1 first.")
+                st.info("Please create a course first.")
             else:
                 c_dict = {c['course_code']: c for c in my_courses}
                 selected_poll_c_code = st.selectbox("Select Course for Live Polling", list(c_dict.keys()), key="menti_course_sel")
@@ -1452,7 +1470,6 @@ elif portal_mode == "Instructor / Admin Login":
                     curr_poll = poll_map[sel_poll_label]
                     curr_poll_id = curr_poll['poll_id']
                     
-                    # Control Bar
                     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
                     with ctrl1:
                         if curr_poll['is_active']:
@@ -1481,7 +1498,6 @@ elif portal_mode == "Instructor / Admin Login":
                             supabase.table("live_polls").delete().eq("poll_id", curr_poll_id).execute()
                             st.rerun()
 
-                    # Auto-Refreshing Projector Fragment (Updates every 3 seconds while voting is open)
                     @st.fragment(run_every="3s" if curr_poll['is_active'] else None)
                     def render_live_projector_results(poll_obj):
                         resps = supabase.table("poll_responses").select("*").eq("poll_id", poll_obj['poll_id']).execute().data
