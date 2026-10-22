@@ -8,6 +8,7 @@ import json
 import pandas as pd
 import time
 import hashlib
+from collections import Counter
 from google import genai
 from google.genai import types
 
@@ -212,7 +213,6 @@ def parse_uploaded_rubric_file(uploaded_file):
     else:
         df = pd.read_excel(uploaded_file)
         
-    # Map flexible header names to standard internal column keys
     col_mapping = {}
     for col in df.columns:
         c_low = str(col).strip().lower()
@@ -294,6 +294,36 @@ def format_rubric_for_display(rubric_json):
             "1 – Needs Improvement": r.get("level_1", "Missing, inaccurate, or irrelevant.")
         })
     return pd.DataFrame(rows)
+
+def render_visual_wordcloud(words_list):
+    """Renders an interactive HTML/CSS Word Cloud scaled by frequency."""
+    if not words_list:
+        st.info("Waiting for responses...")
+        return
+    cleaned = [w.strip().upper() for w in words_list if w and w.strip()]
+    counts = Counter(cleaned)
+    max_c = max(counts.values()) if counts else 1
+    
+    palette = ["#1d4ed8", "#047857", "#b45309", "#7c3aed", "#be123c", "#0f766e", "#4338ca"]
+    badges_html = []
+    for idx, (word, count) in enumerate(counts.most_common(50)):
+        size_px = int(18 + (count / max_c) * 28)
+        color = palette[idx % len(palette)]
+        badges_html.append(
+            f"<span style='font-size:{size_px}px; font-weight:700; color:{color}; "
+            f"background:#f8fafc; border:2px solid {color}33; padding:6px 16px; "
+            f"border-radius:999px; margin:6px; display:inline-block; "
+            f"box-shadow:0 2px 4px rgba(0,0,0,0.06);'>"
+            f"{word} <sup style='font-size:13px; color:#475569;'>({count})</sup></span>"
+        )
+    cloud_box = (
+        "<div style='display:flex; flex-wrap:wrap; justify-content:center; "
+        "align-items:center; padding:28px; background:#ffffff; "
+        "border:2px dashed #cbd5e1; border-radius:14px; min-height:180px;'>"
+        + "".join(badges_html) +
+        "</div>"
+    )
+    st.markdown(cloud_box, unsafe_allow_html=True)
 
 def get_or_create_folder(folder_name, parent_ref):
     if "folders/" in parent_ref:
@@ -421,8 +451,15 @@ SAMPLE_RUBRIC_CSV_BYTES = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC).to_csv(index=F
 # ==========================================
 # SIDEBAR NAVIGATION
 # ==========================================
-st.sidebar.title("🧪 IEER Lab & Design Grader")
-portal_mode = st.sidebar.radio("Select Portal", ["Student Submission Portal", "Instructor / Admin Login"])
+st.sidebar.title("🧪 IEER Smart Portal")
+portal_mode = st.sidebar.radio(
+    "Select Portal",
+    [
+        "Student Submission Portal",
+        "🎯 Live Class Poll & Quiz",
+        "Instructor / Admin Login"
+    ]
+)
 
 # ==========================================
 # PORTAL 1: SECURE STUDENT SUBMISSION PORTAL
@@ -466,7 +503,7 @@ if portal_mode == "Student Submission Portal":
                     st.session_state.pop('verified_student', None)
                     st.error("❌ Credentials not found in the official class roster for this course.")
                     
-        if 'verified_student' in st.session_state:
+        if 'verified_student' in st.session_state and st.session_state['verified_student'].get('course_id') == course_id:
             student_info = st.session_state['verified_student']
             
             exps_res = supabase.table("experiments").select("*").eq("course_id", course_id).eq("is_open", True).execute()
@@ -548,7 +585,126 @@ if portal_mode == "Student Submission Portal":
                                     st.error(f"An error occurred during submission: {e}")
 
 # ==========================================
-# PORTAL 2: INSTRUCTOR & ADMIN PORTAL
+# PORTAL 2: LIVE CLASS POLL & QUIZ (STUDENT MENTI PORTAL)
+# ==========================================
+elif portal_mode == "🎯 Live Class Poll & Quiz":
+    st.title("🎯 Live Class Poll, Word Cloud & Quiz")
+    st.markdown("Verify your course enrollment below to participate in live classroom polls and graded quizzes. **Note: Each question allows strictly ONE submission—answers cannot be changed once submitted.**")
+    
+    courses_res = supabase.table("courses").select("course_id, course_code, course_title").execute()
+    courses = courses_res.data
+    
+    if not courses:
+        st.warning("No active courses available.")
+    else:
+        course_options = {f"{c['course_code']} - {c['course_title']}": c for c in courses}
+        selected_course_label = st.selectbox("Select Your Course", list(course_options.keys()), key="poll_course_sel")
+        selected_course_obj = course_options[selected_course_label]
+        course_id = selected_course_obj['course_id']
+        
+        st.markdown("---")
+        st.subheader("Step 1: Verify Roster Identity")
+        with st.form("poll_student_auth_form"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                input_reg = st.text_input("Registration Number (e.g., 2023-MS-EN-201)").strip().upper()
+            with col_b:
+                input_email = st.text_input("University Email").strip().lower()
+            verify_poll_btn = st.form_submit_button("Join Live Session")
+            
+        if verify_poll_btn:
+            if not input_reg or not input_email:
+                st.error("Please enter both your Registration Number and University Email.")
+            else:
+                student_check = supabase.table("students").select("*").eq("course_id", course_id).eq("reg_no", input_reg).eq("email", input_email).execute().data
+                if student_check:
+                    st.session_state['verified_student'] = student_check[0]
+                    st.success(f"Connected! Welcome, **{student_check[0]['student_name']}** ({student_check[0]['reg_no']}).")
+                else:
+                    st.session_state.pop('verified_student', None)
+                    st.error("❌ Not found in the official roster for this course. Please contact your instructor.")
+                    
+        if 'verified_student' in st.session_state and st.session_state['verified_student'].get('course_id') == course_id:
+            student_info = st.session_state['verified_student']
+            
+            col_hdr, col_ref = st.columns([4, 1])
+            with col_hdr:
+                st.subheader(f"Step 2: Active Questions for {selected_course_obj['course_code']}")
+            with col_ref:
+                if st.button("🔄 Refresh Active Polls"):
+                    st.rerun()
+                    
+            active_polls = supabase.table("live_polls").select("*").eq("course_id", course_id).eq("is_active", True).order("created_at", desc=True).execute().data
+            
+            if not active_polls:
+                st.info("⏳ No live poll or quiz is currently open for voting. Wait for your instructor to launch a question, then click **🔄 Refresh Active Polls**.")
+            else:
+                for poll in active_polls:
+                    p_id = poll['poll_id']
+                    p_type = poll['poll_type']
+                    type_badge = {
+                        "mcq": "📊 Live Multiple Choice Poll",
+                        "quiz": f"🏆 Graded Quiz ({poll.get('marks', 1.0)} Marks)",
+                        "wordcloud": "☁️ Live Word Cloud"
+                    }.get(p_type, "📊 Poll")
+                    
+                    with st.container(border=True):
+                        st.markdown(f"**{type_badge}**")
+                        st.markdown(f"### {poll['question_text']}")
+                        
+                        # Check if student has already submitted (Strict 1-submission lock)
+                        existing_vote = supabase.table("poll_responses").select("*").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
+                        
+                        if existing_vote:
+                            my_resp = existing_vote[0]
+                            st.success(f"🔒 **Submission Locked:** You submitted **`{my_resp['response_text']}`**. Further changes are disabled.")
+                            if p_type == "quiz" and poll.get("reveal_answer"):
+                                if my_resp.get("is_correct"):
+                                    st.balloons()
+                                    st.info(f"✅ **Correct!** Answer: `{poll['correct_answer']}` | Marks Earned: **{my_resp['marks_awarded']} / {poll['marks']}**")
+                                else:
+                                    st.warning(f"❌ **Incorrect.** Correct Answer: `{poll['correct_answer']}` | Marks Earned: **0 / {poll['marks']}**")
+                        else:
+                            with st.form(f"vote_form_{p_id}"):
+                                if p_type in ["mcq", "quiz"]:
+                                    opts = poll.get("options_json") or []
+                                    choice = st.radio("Select your answer (One attempt only):", opts, index=None, key=f"radio_{p_id}")
+                                else:
+                                    choice = st.text_input("Enter your word or short phrase (max 25 characters):", max_chars=25, key=f"wc_{p_id}").strip()
+                                    
+                                submit_vote = st.form_submit_button("🔒 Submit Final Response (No Changes Allowed)", type="primary")
+                                if submit_vote:
+                                    if not choice:
+                                        st.error("Please enter or select a response before submitting.")
+                                    else:
+                                        # Double-check in database before inserting to prevent race-condition duplicates
+                                        recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
+                                        if recheck:
+                                            st.warning("Your response was already recorded.")
+                                            st.rerun()
+                                        else:
+                                            is_corr = False
+                                            awarded = 0.0
+                                            if p_type == "quiz":
+                                                is_corr = (str(choice).strip() == str(poll.get("correct_answer", "")).strip())
+                                                awarded = float(poll.get("marks", 1.0)) if is_corr else 0.0
+                                                
+                                            try:
+                                                supabase.table("poll_responses").insert({
+                                                    "poll_id": p_id,
+                                                    "reg_no": student_info['reg_no'],
+                                                    "student_name": student_info['student_name'],
+                                                    "response_text": str(choice).strip(),
+                                                    "is_correct": is_corr,
+                                                    "marks_awarded": awarded
+                                                }).execute()
+                                                st.success("✅ Your response has been locked in!")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Could not submit response: {e}")
+
+# ==========================================
+# PORTAL 3: INSTRUCTOR & ADMIN PORTAL
 # ==========================================
 elif portal_mode == "Instructor / Admin Login":
     st.title("🔒 Faculty & Administration Portal")
@@ -617,19 +773,21 @@ elif portal_mode == "Instructor / Admin Login":
                 return supabase.table("courses").select("*").eq("teacher_username", current_user["username"]).execute().data
 
         if is_admin:
-            tab_admin, tab1, tab2, tab3, tab4 = st.tabs([
+            tab_admin, tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "🛡️ Manage Teachers (Admin)", 
                 "📚 Course & Likert Rubric", 
                 "👥 Class Roster Upload", 
                 "🔬 Assessments & Custom Rubrics", 
-                "📊 Grading & Export"
+                "📊 Grading & Export",
+                "🎯 Live Polls & Quizzes (Menti)"
             ])
         else:
-            tab1, tab2, tab3, tab4 = st.tabs([
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📚 Course & Likert Rubric", 
                 "👥 Class Roster Upload", 
                 "🔬 Assessments & Custom Rubrics", 
-                "📊 Grading & Export"
+                "📊 Grading & Export",
+                "🎯 Live Polls & Quizzes (Menti)"
             ])
             
         # ==========================================
@@ -772,10 +930,10 @@ elif portal_mode == "Instructor / Admin Login":
                         st.dataframe(format_rubric_for_display(c['rubric_json']), use_container_width=True, hide_index=True)
 
         # ==========================================
-        # TAB 2: CLASS ROSTER UPLOAD
+        # TAB 2: CLASS ROSTER UPLOAD & STUDENT EDITOR
         # ==========================================
         with tab2:
-            st.subheader("Upload Class Roster (CSV / Excel)")
+            st.subheader("Upload & Manage Class Roster (CSV / Excel)")
             st.markdown("Upload a spreadsheet containing your student class list. The file must include these exact column headers: **`reg_no`**, **`student_name`**, and **`email`**.")
             
             sample_df = pd.DataFrame({
@@ -832,16 +990,53 @@ elif portal_mode == "Instructor / Admin Login":
                 
                 st.markdown("---")
                 st.markdown("### Currently Enrolled Roster")
-                roster_res = supabase.table("students").select("reg_no, student_name, email").eq("course_id", selected_course_id).execute()
+                roster_res = supabase.table("students").select("student_id, reg_no, student_name, email").eq("course_id", selected_course_id).order("reg_no").execute()
                 if roster_res.data:
-                    st.dataframe(pd.DataFrame(roster_res.data), use_container_width=True)
+                    st.dataframe(pd.DataFrame(roster_res.data)[["reg_no", "student_name", "email"]], use_container_width=True, hide_index=True)
+                    
+                    with st.expander("🛠️ Fix / Edit or Delete a Student Record (Avoids Duplicate Key Errors)"):
+                        stu_map = {f"{s['reg_no']} — {s['student_name']} ({s['email']})": s for s in roster_res.data}
+                        sel_stu_label = st.selectbox("Select Student to Edit or Remove", list(stu_map.keys()))
+                        sel_stu = stu_map[sel_stu_label]
+                        
+                        col_ed1, col_ed2, col_ed3 = st.columns(3)
+                        with col_ed1:
+                            new_s_reg = st.text_input("Updated Reg No", value=sel_stu['reg_no']).strip().upper()
+                        with col_ed2:
+                            new_s_name = st.text_input("Updated Full Name", value=sel_stu['student_name']).strip()
+                        with col_ed3:
+                            new_s_email = st.text_input("Updated Email", value=sel_stu['email']).strip().lower()
+                            
+                        col_btn_up, col_btn_del = st.columns(2)
+                        with col_btn_up:
+                            if st.button("💾 Save Student Changes", key="btn_upd_stu"):
+                                try:
+                                    # Check if another student row already has the target reg_no
+                                    clash = supabase.table("students").select("student_id").eq("course_id", selected_course_id).eq("reg_no", new_s_reg).neq("student_id", sel_stu["student_id"]).execute().data
+                                    if clash:
+                                        # Remove the duplicate row first so update succeeds cleanly
+                                        supabase.table("students").delete().eq("student_id", clash[0]["student_id"]).execute()
+                                    supabase.table("students").update({
+                                        "reg_no": new_s_reg,
+                                        "student_name": new_s_name,
+                                        "email": new_s_email
+                                    }).eq("student_id", sel_stu["student_id"]).execute()
+                                    st.success("Student record updated cleanly!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error updating student: {e}")
+                        with col_btn_del:
+                            if st.button("🗑️ Delete This Student from Roster", key="btn_del_stu"):
+                                supabase.table("students").delete().eq("student_id", sel_stu["student_id"]).execute()
+                                st.success("Student removed from roster.")
+                                st.rerun()
                 else:
                     st.info("No students uploaded for this course yet.")
             else:
                 st.info("No courses assigned to your account yet. Please create a course in Tab 1.")
 
         # ==========================================
-        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC BUILDER
+        # TAB 3: ASSESSMENTS & CUSTOM RUBRIC CSV UPLOAD
         # ==========================================
         with tab3:
             st.subheader("Manage Experiments, Combined Packets & Design Reports")
@@ -855,7 +1050,7 @@ elif portal_mode == "Instructor / Admin Login":
                 with col_e1:
                     exp_no = st.number_input("Assessment Number / ID", min_value=1, step=1)
                 with col_e2:
-                    exp_title = st.text_input("Assessment Title * (e.g., Exp 1: pH or Labs 1-6)").strip()
+                    exp_title = st.text_input("Assessment Title * (e.g., Exp 1: pH & Turbidity or Labs 1-6 Combined)").strip()
                 
                 is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Packet or Design Report?", value=False)
                 is_open = st.checkbox("🔓 Accepting Submissions (Open)", value=True)
@@ -872,7 +1067,7 @@ elif portal_mode == "Instructor / Admin Login":
                     col_r_dl, col_r_up = st.columns([1, 2])
                     with col_r_dl:
                         st.download_button(
-                            label="📥 Download Sample Likert CSV",
+                            label="📥 Download Sample Likert Rubric CSV Template",
                             data=SAMPLE_RUBRIC_CSV_BYTES,
                             file_name="custom_likert_rubric_template.csv",
                             mime="text/csv",
@@ -888,14 +1083,14 @@ elif portal_mode == "Instructor / Admin Login":
                     if uploaded_exp_rubric_file is not None:
                         try:
                             default_custom_rubric_df = parse_uploaded_rubric_file(uploaded_exp_rubric_file)
-                            st.success(f"✅ Loaded {len(default_custom_rubric_df)} criteria from file!")
+                            st.success(f"✅ Loaded {len(default_custom_rubric_df)} custom criteria from `{uploaded_exp_rubric_file.name}`!")
                         except Exception as e:
-                            st.error(f"Error reading file: {e}")
+                            st.error(f"Error reading uploaded rubric file: {e}")
                             default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
                     else:
                         template_choice = st.radio(
-                            "Choose starting template:",
-                            ["5-Criterion Design Rubric (20 Marks)", "10-Criterion Lab Rubric (40 Marks)"],
+                            "Or choose a starting template to edit manually:",
+                            ["5-Criterion Engineering Design Rubric (20 Marks)", "10-Criterion Standard Lab Rubric (40 Marks)"],
                             horizontal=True,
                             key="exp_template_radio"
                         )
@@ -919,7 +1114,6 @@ elif portal_mode == "Instructor / Admin Login":
                         key="exp_custom_rubric_editor"
                     )
                 
-                # Button placed cleanly outside any broken form wrapper
                 if st.button("💾 Create / Update Assessment", type="primary", key="btn_save_assessment"):
                     if not exp_title:
                         st.error("❌ Assessment Title is required! Please enter a title above before saving.")
@@ -928,7 +1122,7 @@ elif portal_mode == "Instructor / Admin Login":
                         if use_custom_rubric and edited_exp_rubric is not None:
                             custom_json, custom_total = build_rubric_from_df(edited_exp_rubric)
                             if not custom_json:
-                                st.error("❌ Please provide at least one valid custom rubric criterion with marks > 0.")
+                                st.error("Please provide at least one valid custom rubric criterion with marks > 0.")
                                 st.stop()
                         
                         try:
@@ -945,7 +1139,7 @@ elif portal_mode == "Instructor / Admin Login":
                             time.sleep(1)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ Database error saving assessment: {e}")
+                            st.error(f"Error saving assessment: {e}")
             else:
                 st.info("Please set up a course first in Tab 1.")
 
@@ -1167,3 +1361,180 @@ elif portal_mode == "Instructor / Admin Login":
                     st.info("No assessments created for this course yet.")
             else:
                 st.info("Please set up a course first in Tab 1.")
+
+        # ==========================================
+        # TAB 5: LIVE POLLS, WORD CLOUDS & GRADED QUIZZES (MENTIMETER)
+        # ==========================================
+        with tab5:
+            st.subheader("🎯 Live Classroom Polls, Word Clouds & Graded Quizzes")
+            my_courses = get_accessible_courses()
+            
+            if not my_courses:
+                st.info("Please create a course in Tab 1 first.")
+            else:
+                c_dict = {c['course_code']: c for c in my_courses}
+                selected_poll_c_code = st.selectbox("Select Course for Live Polling", list(c_dict.keys()), key="menti_course_sel")
+                poll_course_info = c_dict[selected_poll_c_code]
+                poll_course_id = poll_course_info['course_id']
+                
+                with st.expander("➕ Create New Poll, Word Cloud, or Graded Quiz Question", expanded=False):
+                    p_type_label = st.radio(
+                        "Question Type",
+                        [
+                            "🏆 Graded Quiz (MCQ with Correct Answer & Marks)",
+                            "📊 Multiple Choice Poll (No Right/Wrong Answer)",
+                            "☁️ Word Cloud (Short 1–3 Word Responses)"
+                        ],
+                        horizontal=True
+                    )
+                    
+                    q_text = st.text_input("Question Prompt *", placeholder="e.g., Which primary pollutant is the main precursor to tropospheric ozone in photochemical smog?").strip()
+                    
+                    options_list = []
+                    correct_opt = None
+                    q_marks = 0.0
+                    
+                    if "Word Cloud" not in p_type_label:
+                        p_type_code = "quiz" if "Graded Quiz" in p_type_label else "mcq"
+                        st.markdown("**Enter Multiple Choice Options (Up to 5 options):**")
+                        oc1, oc2 = st.columns(2)
+                        with oc1:
+                            opt1 = st.text_input("Option A", value="NOx and VOCs").strip()
+                            opt2 = st.text_input("Option B", value="SO2 and Particulate Matter").strip()
+                        with oc2:
+                            opt3 = st.text_input("Option C", value="Carbon Monoxide only").strip()
+                            opt4 = st.text_input("Option D", value="Methane and Ammonia").strip()
+                        opt5 = st.text_input("Option E (Optional)", value="").strip()
+                        
+                        options_list = [o for o in [opt1, opt2, opt3, opt4, opt5] if o]
+                        
+                        if p_type_code == "quiz" and options_list:
+                            qc1, qc2 = st.columns(2)
+                            with qc1:
+                                correct_opt = st.selectbox("Select Correct Answer", options_list)
+                            with qc2:
+                                q_marks = st.number_input("Marks for Correct Answer", min_value=0.5, max_value=20.0, value=1.0, step=0.5)
+                    else:
+                        p_type_code = "wordcloud"
+                        
+                    launch_now = st.checkbox("🟢 Open for Student Voting Immediately", value=True)
+                    
+                    if st.button("🚀 Save Poll / Quiz Question", type="primary"):
+                        if not q_text:
+                            st.error("Please enter a Question Prompt.")
+                        elif p_type_code in ["mcq", "quiz"] and len(options_list) < 2:
+                            st.error("Please provide at least 2 options for a Multiple Choice question.")
+                        else:
+                            supabase.table("live_polls").insert({
+                                "course_id": poll_course_id,
+                                "question_text": q_text,
+                                "poll_type": p_type_code,
+                                "options_json": options_list,
+                                "correct_answer": correct_opt,
+                                "marks": q_marks,
+                                "is_active": launch_now,
+                                "reveal_answer": False
+                            }).execute()
+                            st.success("✅ Question created!")
+                            st.rerun()
+                            
+                st.markdown("---")
+                all_polls = supabase.table("live_polls").select("*").eq("course_id", poll_course_id).order("created_at", desc=True).execute().data
+                
+                if not all_polls:
+                    st.info("No live polls or quizzes created for this course yet. Expand the box above to create one.")
+                else:
+                    poll_map = {
+                        f"{'🟢 [OPEN] ' if p['is_active'] else '🔴 [CLOSED] '}[{p['poll_type'].upper()}] {p['question_text']}": p
+                        for p in all_polls
+                    }
+                    sel_poll_label = st.selectbox("Select Question to Present or Manage", list(poll_map.keys()))
+                    curr_poll = poll_map[sel_poll_label]
+                    curr_poll_id = curr_poll['poll_id']
+                    
+                    # Control Bar
+                    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
+                    with ctrl1:
+                        if curr_poll['is_active']:
+                            if st.button("🔴 Close Voting", use_container_width=True):
+                                supabase.table("live_polls").update({"is_active": False}).eq("poll_id", curr_poll_id).execute()
+                                st.rerun()
+                        else:
+                            if st.button("🟢 Open Voting", use_container_width=True):
+                                supabase.table("live_polls").update({"is_active": True}).eq("poll_id", curr_poll_id).execute()
+                                st.rerun()
+                    with ctrl2:
+                        if curr_poll['poll_type'] == 'quiz':
+                            if curr_poll.get('reveal_answer'):
+                                if st.button("🙈 Hide Correct Answer", use_container_width=True):
+                                    supabase.table("live_polls").update({"reveal_answer": False}).eq("poll_id", curr_poll_id).execute()
+                                    st.rerun()
+                            else:
+                                if st.button("👁️ Reveal Correct Answer", use_container_width=True):
+                                    supabase.table("live_polls").update({"reveal_answer": True}).eq("poll_id", curr_poll_id).execute()
+                                    st.rerun()
+                    with ctrl3:
+                        if st.button("🔄 Refresh Live Chart", use_container_width=True):
+                            st.rerun()
+                    with ctrl4:
+                        if st.button("🗑️ Delete Question", use_container_width=True):
+                            supabase.table("live_polls").delete().eq("poll_id", curr_poll_id).execute()
+                            st.rerun()
+
+                    # Auto-Refreshing Projector Fragment (Updates every 3 seconds while voting is open)
+                    @st.fragment(run_every="3s" if curr_poll['is_active'] else None)
+                    def render_live_projector_results(poll_obj):
+                        resps = supabase.table("poll_responses").select("*").eq("poll_id", poll_obj['poll_id']).execute().data
+                        roster_count_res = supabase.table("students").select("student_id").eq("course_id", poll_course_id).execute().data
+                        total_enrolled = len(roster_count_res) if roster_count_res else 0
+                        
+                        st.markdown(f"## 📢 {poll_obj['question_text']}")
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Locked Responses Received", f"{len(resps)} / {total_enrolled if total_enrolled else '?'}")
+                        m2.metric("Voting Status", "🟢 OPEN (Auto-Refreshing)" if poll_obj['is_active'] else "🔴 CLOSED")
+                        if poll_obj['poll_type'] == 'quiz':
+                            correct_cnt = sum(1 for r in resps if r.get('is_correct'))
+                            m3.metric("Correct Responses", f"{correct_cnt} / {len(resps)}" if poll_obj.get('reveal_answer') else "Hidden until revealed")
+                            
+                        if poll_obj['poll_type'] in ['mcq', 'quiz']:
+                            opts = poll_obj.get('options_json') or []
+                            counts = {o: 0 for o in opts}
+                            for r in resps:
+                                ans = r.get('response_text')
+                                if ans in counts:
+                                    counts[ans] += 1
+                                elif ans:
+                                    counts[ans] = counts.get(ans, 0) + 1
+                                    
+                            chart_df = pd.DataFrame({
+                                "Option": list(counts.keys()),
+                                "Votes": list(counts.values())
+                            })
+                            st.bar_chart(chart_df.set_index("Option"), height=320)
+                            
+                            if poll_obj['poll_type'] == 'quiz' and poll_obj.get('reveal_answer'):
+                                st.success(f"✅ **Correct Answer:** `{poll_obj.get('correct_answer')}` ({poll_obj.get('marks', 1.0)} Marks)")
+                        else:
+                            words = [r.get('response_text', '') for r in resps]
+                            render_visual_wordcloud(words)
+                            
+                        if resps:
+                            with st.expander("📋 View Individual Student Responses & Export to Excel"):
+                                df_r = pd.DataFrame(resps)[["reg_no", "student_name", "response_text", "is_correct", "marks_awarded", "submitted_at"]]
+                                df_r.columns = ["Reg No", "Student Name", "Submitted Response", "Is Correct", "Marks Awarded", "Timestamp"]
+                                st.dataframe(df_r, use_container_width=True, hide_index=True)
+                                
+                                poll_excel_buf = io.BytesIO()
+                                with pd.ExcelWriter(poll_excel_buf, engine='openpyxl') as writer:
+                                    df_r.to_excel(writer, index=False, sheet_name="Poll_Responses")
+                                poll_excel_buf.seek(0)
+                                
+                                st.download_button(
+                                    label="📥 Download Question Responses & Marks (.xlsx)",
+                                    data=poll_excel_buf,
+                                    file_name=f"{selected_poll_c_code}_Poll_Responses.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_poll_{poll_obj['poll_id']}"
+                                )
+
+                    render_live_projector_results(curr_poll)
