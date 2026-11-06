@@ -8,6 +8,8 @@ import json
 import pandas as pd
 import time
 import hashlib
+import urllib.parse
+from datetime import datetime, timezone, timedelta
 from collections import Counter
 from google import genai
 from google.genai import types
@@ -55,6 +57,7 @@ COL_DRIVE_FILE = "drive_" + "file_id"
 PARAM_FILE_KEY = "file" + "Id"
 
 ROOT_DRIVE_CONTAINER = st.secrets["google_drive"][DRIVE_ROOT_KEY]
+APP_PUBLIC_URL = "https://smartedtools-lab-report.streamlit.app"
 
 # ==========================================
 # DEFAULT 4-POINT LIKERT SCALE RUBRIC TEMPLATES
@@ -186,7 +189,7 @@ DEFAULT_DESIGN_LIKERT_RUBRIC = [
 ]
 
 # ==========================================
-# HELPER FUNCTIONS: AUTH, RUBRIC CSV, DRIVE & GEMINI
+# HELPER FUNCTIONS: AUTH, RUBRIC CSV, TIMERS, DRIVE & GEMINI
 # ==========================================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
@@ -205,6 +208,40 @@ def ensure_default_admin():
             }).execute()
     except Exception:
         pass
+
+def get_remaining_seconds(poll_obj):
+    """Calculates remaining countdown seconds from UTC timer_ends_at and auto-closes expired polls."""
+    ends_str = poll_obj.get("timer_ends_at")
+    if not ends_str:
+        return None
+    try:
+        ends_dt = datetime.fromisoformat(str(ends_str).replace("Z", "+00:00"))
+        if ends_dt.tzinfo is None:
+            ends_dt = ends_dt.replace(tzinfo=timezone.utc)
+        rem = int((ends_dt - datetime.now(timezone.utc)).total_seconds())
+        if rem <= 0:
+            if poll_obj.get("is_active"):
+                try:
+                    supabase.table("live_polls").update({"is_active": False}).eq("poll_id", poll_obj["poll_id"]).execute()
+                    poll_obj["is_active"] = False
+                except Exception:
+                    pass
+            return 0
+        return rem
+    except Exception:
+        return None
+
+def activate_slide_with_timer(course_id: str, poll_id: str, duration_sec: int):
+    """Closes any other active slide in the course and opens the target slide with a fresh countdown timer."""
+    ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=int(duration_sec))).isoformat()
+    supabase.table("live_polls").update({"is_active": False}).eq("course_id", course_id).execute()
+    supabase.table("live_polls").update({
+        "is_active": True,
+        "show_results": False,
+        "reveal_answer": False,
+        "timer_seconds": int(duration_sec),
+        "timer_ends_at": ends_iso
+    }).eq("poll_id", poll_id).execute()
 
 def parse_uploaded_rubric_file(uploaded_file):
     """Reads an uploaded CSV or Excel rubric file and normalizes column headers."""
@@ -298,7 +335,7 @@ def format_rubric_for_display(rubric_json):
 def render_visual_wordcloud(words_list):
     """Renders an interactive HTML/CSS Word Cloud scaled by frequency."""
     if not words_list:
-        st.info("Waiting for responses...")
+        st.info("Waiting for student word submissions...")
         return
     cleaned = [w.strip().upper() for w in words_list if w and w.strip()]
     counts = Counter(cleaned)
@@ -324,6 +361,31 @@ def render_visual_wordcloud(words_list):
         "</div>"
     )
     st.markdown(cloud_box, unsafe_allow_html=True)
+
+def render_projector_option_cards(options_list, correct_answer=None, reveal_answer=False):
+    """Displays large, classroom-readable Multiple Choice option cards on the projector screen."""
+    if not options_list:
+        return
+    letters = ["A", "B", "C", "D", "E", "F"]
+    cols = st.columns(2)
+    for idx, opt in enumerate(options_list):
+        letter = letters[idx] if idx < len(letters) else str(idx + 1)
+        is_corr = reveal_answer and correct_answer and (str(opt).strip() == str(correct_answer).strip())
+        border_col = "#16a34a" if is_corr else "#cbd5e1"
+        bg_col = "#f0fdf4" if is_corr else "#f8fafc"
+        badge_bg = "#16a34a" if is_corr else "#1e293b"
+        check_mark = " ✅" if is_corr else ""
+        card_html = (
+            f"<div style='background:{bg_col}; border:2px solid {border_col}; border-radius:12px; "
+            f"padding:14px 18px; margin-bottom:10px; display:flex; align-items:center; gap:14px;'>"
+            f"<span style='background:{badge_bg}; color:white; font-weight:800; font-size:18px; "
+            f"width:36px; height:36px; border-radius:8px; display:inline-flex; align-items:center; "
+            f"justify-content:center; flex-shrink:0;'>{letter}</span>"
+            f"<span style='font-size:18px; font-weight:600; color:#0f172a;'>{opt}{check_mark}</span>"
+            f"</div>"
+        )
+        with cols[idx % 2]:
+            st.markdown(card_html, unsafe_allow_html=True)
 
 def get_or_create_folder(folder_name, parent_ref):
     if "folders/" in parent_ref:
@@ -445,7 +507,6 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
                 )
                 parsed = json.loads(response.text)
                 
-                # Enforce that all rubric criteria are present in the returned JSON
                 returned_map = {
                     str(c.get("criterion", "")).strip().lower(): c
                     for c in (parsed.get("criteria_scores") or [])
@@ -476,7 +537,6 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                # If rate-limited (429 / quota), wait longer before retrying
                 if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
                     time.sleep(12 * (attempt + 1))
                 else:
@@ -491,16 +551,23 @@ ensure_default_admin()
 SAMPLE_RUBRIC_CSV_BYTES = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC).to_csv(index=False).encode("utf-8")
 
 # ==========================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NAVIGATION & QR URL PARAMETER ROUTING
 # ==========================================
 st.sidebar.title("🧪 IEER Smart Portal")
+portal_list = [
+    "Student Submission Portal",
+    "🎯 Live Class Poll & Quiz",
+    "Instructor / Admin Login"
+]
+
+qp_portal = st.query_params.get("portal", "").lower()
+qp_course = st.query_params.get("course", "").upper()
+
+default_portal_idx = 1 if qp_portal == "poll" else 0
 portal_mode = st.sidebar.radio(
     "Select Portal",
-    [
-        "Student Submission Portal",
-        "🎯 Live Class Poll & Quiz",
-        "Instructor / Admin Login"
-    ]
+    portal_list,
+    index=default_portal_idx
 )
 
 # ==========================================
@@ -631,7 +698,9 @@ if portal_mode == "Student Submission Portal":
 # ==========================================
 elif portal_mode == "🎯 Live Class Poll & Quiz":
     st.title("🎯 Live Class Poll, Word Cloud & Quiz")
-    st.markdown("Verify your course enrollment below to participate in live classroom polls and graded quizzes. **Note: Each question allows strictly ONE submission—answers cannot be changed once submitted.**")
+    st.markdown(
+        "Verify your course enrollment once below. Your screen will **automatically sync with the classroom projector** as your instructor advances from slide to slide."
+    )
     
     courses_res = supabase.table("courses").select("course_id, course_code, course_title").execute()
     courses = courses_res.data
@@ -639,109 +708,150 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
     if not courses:
         st.warning("No active courses available.")
     else:
+        course_labels = [f"{c['course_code']} - {c['course_title']}" for c in courses]
         course_options = {f"{c['course_code']} - {c['course_title']}": c for c in courses}
-        selected_course_label = st.selectbox("Select Your Course", list(course_options.keys()), key="poll_course_sel")
+        
+        preselect_idx = 0
+        if qp_course:
+            for idx_c, c_obj in enumerate(courses):
+                if c_obj['course_code'].upper() == qp_course:
+                    preselect_idx = idx_c
+                    break
+                    
+        selected_course_label = st.selectbox("Select Your Course", course_labels, index=preselect_idx, key="poll_course_sel")
         selected_course_obj = course_options[selected_course_label]
         course_id = selected_course_obj['course_id']
         
         st.markdown("---")
-        st.subheader("Step 1: Verify Roster Identity")
-        with st.form("poll_student_auth_form"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                input_reg = st.text_input("Registration Number (e.g., 2023-MS-EN-201)").strip().upper()
-            with col_b:
-                input_email = st.text_input("University Email").strip().lower()
-            verify_poll_btn = st.form_submit_button("Join Live Session")
-            
-        if verify_poll_btn:
-            if not input_reg or not input_email:
-                st.error("Please enter both your Registration Number and University Email.")
-            else:
-                student_check = supabase.table("students").select("*").eq("course_id", course_id).eq("reg_no", input_reg).eq("email", input_email).execute().data
-                if student_check:
-                    st.session_state['verified_student'] = student_check[0]
-                    st.success(f"Connected! Welcome, **{student_check[0]['student_name']}** ({student_check[0]['reg_no']}).")
+        if 'verified_student' not in st.session_state or st.session_state['verified_student'].get('course_id') != course_id:
+            st.subheader("Step 1: Verify Roster Identity")
+            with st.form("poll_student_auth_form"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    input_reg = st.text_input("Registration Number (e.g., 2023-MS-EN-201)").strip().upper()
+                with col_b:
+                    input_email = st.text_input("University Email").strip().lower()
+                verify_poll_btn = st.form_submit_button("🚀 Join Live Classroom Session", type="primary")
+                
+            if verify_poll_btn:
+                if not input_reg or not input_email:
+                    st.error("Please enter both your Registration Number and University Email.")
                 else:
-                    st.session_state.pop('verified_student', None)
-                    st.error("❌ Not found in the official roster for this course. Please contact your instructor.")
-                    
-        if 'verified_student' in st.session_state and st.session_state['verified_student'].get('course_id') == course_id:
+                    student_check = supabase.table("students").select("*").eq("course_id", course_id).eq("reg_no", input_reg).eq("email", input_email).execute().data
+                    if student_check:
+                        st.session_state['verified_student'] = student_check[0]
+                        st.rerun()
+                    else:
+                        st.error("❌ Not found in the official roster for this course. Please contact your instructor.")
+        else:
             student_info = st.session_state['verified_student']
-            
-            col_hdr, col_ref = st.columns([4, 1])
-            with col_hdr:
-                st.subheader(f"Step 2: Active Questions for {selected_course_obj['course_code']}")
-            with col_ref:
-                if st.button("🔄 Refresh Active Polls"):
+            col_s_info, col_s_switch = st.columns([4, 1])
+            with col_s_info:
+                st.success(f"🟢 Connected: **{student_info['student_name']}** (`{student_info['reg_no']}`) — Course: **{selected_course_obj['course_code']}**")
+            with col_s_switch:
+                if st.button("Switch Student"):
+                    st.session_state.pop('verified_student', None)
                     st.rerun()
+
+            @st.fragment(run_every="3s")
+            def render_student_live_slide(c_id, c_code, stu):
+                active_polls = (
+                    supabase.table("live_polls")
+                    .select("*")
+                    .eq("course_id", c_id)
+                    .eq("is_active", True)
+                    .order("slide_order")
+                    .execute()
+                    .data
+                )
+                
+                if not active_polls:
+                    st.info("⏳ **Waiting for instructor...** No slide is currently open for voting. Keep this screen open—it will update automatically as soon as the next question launches!")
+                    return
+                
+                poll = active_polls[0]
+                p_id = poll['poll_id']
+                p_type = poll['poll_type']
+                rem_sec = get_remaining_seconds(poll)
+                
+                if rem_sec is not None and rem_sec <= 0:
+                    st.warning("⏰ **Time is up for this question!** Waiting for the instructor to advance to the next slide...")
+                    return
+                
+                session_lbl = poll.get("session_title") or "Live Session"
+                slide_no = poll.get("slide_order") or 1
+                type_badge = {
+                    "mcq": "📊 Live Multiple Choice Poll",
+                    "quiz": f"🏆 Graded Quiz ({poll.get('marks', 1.0)} Marks)",
+                    "wordcloud": "☁️ Live Word Cloud"
+                }.get(p_type, "📊 Poll")
+                
+                with st.container(border=True):
+                    top_c1, top_c2 = st.columns([3, 1])
+                    with top_c1:
+                        st.caption(f"📌 **{session_lbl} — Slide #{slide_no}** | {type_badge}")
+                    with top_c2:
+                        if rem_sec is not None:
+                            st.markdown(f"### ⏱️ `{rem_sec}s`")
+                            
+                    st.markdown(f"### {poll['question_text']}")
                     
-            active_polls = supabase.table("live_polls").select("*").eq("course_id", course_id).eq("is_active", True).order("created_at", desc=True).execute().data
-            
-            if not active_polls:
-                st.info("⏳ No live poll or quiz is currently open for voting. Wait for your instructor to launch a question, then click **🔄 Refresh Active Polls**.")
-            else:
-                for poll in active_polls:
-                    p_id = poll['poll_id']
-                    p_type = poll['poll_type']
-                    type_badge = {
-                        "mcq": "📊 Live Multiple Choice Poll",
-                        "quiz": f"🏆 Graded Quiz ({poll.get('marks', 1.0)} Marks)",
-                        "wordcloud": "☁️ Live Word Cloud"
-                    }.get(p_type, "📊 Poll")
+                    existing_vote = (
+                        supabase.table("poll_responses")
+                        .select("*")
+                        .eq("poll_id", p_id)
+                        .eq("reg_no", stu['reg_no'])
+                        .execute()
+                        .data
+                    )
                     
-                    with st.container(border=True):
-                        st.markdown(f"**{type_badge}**")
-                        st.markdown(f"### {poll['question_text']}")
-                        
-                        existing_vote = supabase.table("poll_responses").select("*").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
-                        
-                        if existing_vote:
-                            my_resp = existing_vote[0]
-                            st.success(f"🔒 **Submission Locked:** You submitted **`{my_resp['response_text']}`**. Further changes are disabled.")
-                            if p_type == "quiz" and poll.get("reveal_answer"):
-                                if my_resp.get("is_correct"):
-                                    st.balloons()
-                                    st.info(f"✅ **Correct!** Answer: `{poll['correct_answer']}` | Marks Earned: **{my_resp['marks_awarded']} / {poll['marks']}**")
+                    if existing_vote:
+                        my_resp = existing_vote[0]
+                        st.success(
+                            f"🔒 **Answer Locked:** You submitted **`{my_resp['response_text']}`**. "
+                            f"Wait for the instructor to advance to the next slide."
+                        )
+                        if p_type == "quiz" and poll.get("reveal_answer"):
+                            if my_resp.get("is_correct"):
+                                st.info(f"✅ **Correct!** Answer: `{poll['correct_answer']}` | Marks Earned: **{my_resp['marks_awarded']} / {poll['marks']}**")
+                            else:
+                                st.warning(f"❌ **Incorrect.** Correct Answer: `{poll['correct_answer']}` | Marks Earned: **0 / {poll['marks']}**")
+                    else:
+                        with st.form(f"student_vote_form_{p_id}"):
+                            if p_type in ["mcq", "quiz"]:
+                                opts = poll.get("options_json") or []
+                                choice = st.radio("Select your answer (Strictly ONE attempt):", opts, index=None, key=f"stu_radio_{p_id}")
+                            else:
+                                choice = st.text_input("Enter your word or short phrase (max 25 chars):", max_chars=25, key=f"stu_wc_{p_id}").strip()
+                                
+                            submit_vote = st.form_submit_button("🔒 Submit & Lock Answer", type="primary")
+                            if submit_vote:
+                                latest_poll = supabase.table("live_polls").select("*").eq("poll_id", p_id).single().execute().data
+                                latest_rem = get_remaining_seconds(latest_poll)
+                                if not latest_poll.get("is_active") or (latest_rem is not None and latest_rem <= 0):
+                                    st.error("⏰ Voting for this slide has just closed!")
+                                    st.rerun()
+                                elif not choice:
+                                    st.error("Please select or type your response before submitting.")
                                 else:
-                                    st.warning(f"❌ **Incorrect.** Correct Answer: `{poll['correct_answer']}` | Marks Earned: **0 / {poll['marks']}**")
-                        else:
-                            with st.form(f"vote_form_{p_id}"):
-                                if p_type in ["mcq", "quiz"]:
-                                    opts = poll.get("options_json") or []
-                                    choice = st.radio("Select your answer (One attempt only):", opts, index=None, key=f"radio_{p_id}")
-                                else:
-                                    choice = st.text_input("Enter your word or short phrase (max 25 characters):", max_chars=25, key=f"wc_{p_id}").strip()
-                                    
-                                submit_vote = st.form_submit_button("🔒 Submit Final Response (No Changes Allowed)", type="primary")
-                                if submit_vote:
-                                    if not choice:
-                                        st.error("Please enter or select a response before submitting.")
-                                    else:
-                                        recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", student_info['reg_no']).execute().data
-                                        if recheck:
-                                            st.warning("Your response was already recorded.")
-                                            st.rerun()
-                                        else:
-                                            is_corr = False
-                                            awarded = 0.0
-                                            if p_type == "quiz":
-                                                is_corr = (str(choice).strip() == str(poll.get("correct_answer", "")).strip())
-                                                awarded = float(poll.get("marks", 1.0)) if is_corr else 0.0
-                                                
-                                            try:
-                                                supabase.table("poll_responses").insert({
-                                                    "poll_id": p_id,
-                                                    "reg_no": student_info['reg_no'],
-                                                    "student_name": student_info['student_name'],
-                                                    "response_text": str(choice).strip(),
-                                                    "is_correct": is_corr,
-                                                    "marks_awarded": awarded
-                                                }).execute()
-                                                st.success("✅ Your response has been locked in!")
-                                                st.rerun()
-                                            except Exception as e:
-                                                st.error(f"Could not submit response: {e}")
+                                    recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", stu['reg_no']).execute().data
+                                    if not recheck:
+                                        is_corr = False
+                                        awarded = 0.0
+                                        if p_type == "quiz":
+                                            is_corr = (str(choice).strip() == str(latest_poll.get("correct_answer", "")).strip())
+                                            awarded = float(latest_poll.get("marks", 1.0)) if is_corr else 0.0
+                                        supabase.table("poll_responses").insert({
+                                            "poll_id": p_id,
+                                            "reg_no": stu['reg_no'],
+                                            "student_name": stu['student_name'],
+                                            "response_text": str(choice).strip(),
+                                            "is_correct": is_corr,
+                                            "marks_awarded": awarded
+                                        }).execute()
+                                    st.rerun()
+
+            render_student_live_slide(course_id, selected_course_obj['course_code'], student_info)
 
 # ==========================================
 # PORTAL 3: INSTRUCTOR & ADMIN PORTAL
@@ -1288,7 +1398,6 @@ elif portal_mode == "Instructor / Admin Login":
                                         supabase.table("submissions").update({"status": "graded"}).eq("sub_id", sub['sub_id']).execute()
                                         st.toast(f"✅ Graded {sub['reg_no']}: {eval_result['ai_total_score']}/{active_total_marks}")
                                         
-                                        # 4-second pacing delay between manuals to prevent Gemini RPM/TPM quota limits
                                         if idx < len(target_queue) - 1:
                                             time.sleep(4)
                                             
@@ -1318,7 +1427,6 @@ elif portal_mode == "Instructor / Admin Login":
                         detailed_feedback_rows = []
                         extra_criterion_cols = []
                         
-                        # Loop over ALL submissions so no student is ever missing from the analysis table
                         for sub in submissions:
                             s_id = sub['sub_id']
                             reg_no_val = sub['reg_no']
@@ -1459,21 +1567,76 @@ elif portal_mode == "Instructor / Admin Login":
                 st.info("Please set up a course first.")
 
         # ==========================================
-        # SECTION 6: LIVE POLLS & QUIZZES (MENTI)
+        # SECTION 6: MENTIMETER LIVE SLIDE DECK, QR CODE, TIMER & FULL-ROSTER EXCEL
         # ==========================================
         elif chosen_tab == "🎯 Live Polls & Quizzes":
-            st.subheader("🎯 Live Classroom Polls, Word Clouds & Graded Quizzes")
+            st.subheader("🎯 Mentimeter Classroom Slide Deck, Live Timer & Roster Gradebook")
             my_courses = get_accessible_courses()
             
             if not my_courses:
                 st.info("Please create a course first.")
             else:
                 c_dict = {c['course_code']: c for c in my_courses}
-                selected_poll_c_code = st.selectbox("Select Course for Live Polling", list(c_dict.keys()), key="menti_course_sel")
+                top_m1, top_m2 = st.columns([2, 2])
+                with top_m1:
+                    selected_poll_c_code = st.selectbox("Select Course", list(c_dict.keys()), key="menti_course_sel")
                 poll_course_info = c_dict[selected_poll_c_code]
                 poll_course_id = poll_course_info['course_id']
                 
-                with st.expander("➕ Create New Poll, Word Cloud, or Graded Quiz Question", expanded=False):
+                all_course_polls = (
+                    supabase.table("live_polls")
+                    .select("*")
+                    .eq("course_id", poll_course_id)
+                    .order("slide_order")
+                    .order("created_at")
+                    .execute()
+                    .data or []
+                )
+                
+                existing_sessions = sorted(list({(p.get("session_title") or "Class Session 1").strip() for p in all_course_polls}))
+                if not existing_sessions:
+                    existing_sessions = ["Class Session 1"]
+                    
+                with top_m2:
+                    selected_session = st.selectbox("Select Session / Lecture Deck", existing_sessions, key="menti_session_sel")
+                
+                # 1. SCAN-TO-JOIN QR CODE BANNER FOR PROJECTOR
+                join_url = f"{APP_PUBLIC_URL}/?portal=poll&course={urllib.parse.quote(selected_poll_c_code)}"
+                qr_img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=240x240&data={urllib.parse.quote(join_url)}"
+                
+                with st.expander("📱 Show Scan-to-Join QR Code on Projector Screen", expanded=False):
+                    qr_c1, qr_c2 = st.columns([1, 3])
+                    with qr_c1:
+                        st.image(qr_img_url, caption=f"Scan to Join {selected_poll_c_code}", width=220)
+                    with qr_c2:
+                        st.markdown(f"### Join Live Poll & Quiz: **{selected_poll_c_code}**")
+                        st.markdown(f"1. Scan the QR code with your phone camera, **OR** open:\n   ### `{join_url}`")
+                        st.markdown("2. Enter your **Registration Number** and **University Email** once.")
+                        st.markdown("3. Keep your phone screen open—questions will advance automatically as the instructor clicks **Next Slide ➡️**.")
+
+                # 2. ADD NEW SLIDE TO SESSION DECK
+                session_slides = [
+                    p for p in all_course_polls
+                    if (p.get("session_title") or "Class Session 1").strip() == selected_session
+                ]
+                next_slide_num = len(session_slides) + 1
+                
+                with st.expander("➕ Add New Slide / Question to Session Deck", expanded=(len(all_course_polls) == 0)):
+                    sc1, sc2, sc3 = st.columns([2, 1, 2])
+                    with sc1:
+                        session_input = st.text_input("Session / Lecture Deck Name", value=selected_session).strip()
+                    with sc2:
+                        slide_no_input = st.number_input("Slide Order #", min_value=1, value=next_slide_num, step=1)
+                    with sc3:
+                        timer_choice_lbl = st.radio(
+                            "Countdown Timer",
+                            ["30 sec", "60 sec", "90 sec"],
+                            index=0,
+                            horizontal=True,
+                            key="create_timer_radio"
+                        )
+                        timer_sec_val = int(timer_choice_lbl.split()[0])
+                        
                     p_type_label = st.radio(
                         "Question Type",
                         [
@@ -1484,7 +1647,10 @@ elif portal_mode == "Instructor / Admin Login":
                         horizontal=True
                     )
                     
-                    q_text = st.text_input("Question Prompt *", placeholder="e.g., Which primary pollutant is the main precursor to tropospheric ozone in photochemical smog?").strip()
+                    q_text = st.text_input(
+                        "Question Prompt *",
+                        placeholder="e.g., Which primary pollutant is the main precursor to tropospheric ozone in photochemical smog?"
+                    ).strip()
                     
                     options_list = []
                     correct_opt = None
@@ -1513,122 +1679,339 @@ elif portal_mode == "Instructor / Admin Login":
                     else:
                         p_type_code = "wordcloud"
                         
-                    launch_now = st.checkbox("🟢 Open for Student Voting Immediately", value=True)
+                    launch_immediately = st.checkbox("🟢 Launch Slide & Start Countdown Immediately", value=False)
                     
-                    if st.button("🚀 Save Poll / Quiz Question", type="primary"):
+                    if st.button("💾 Save Slide to Deck", type="primary"):
                         if not q_text:
                             st.error("Please enter a Question Prompt.")
                         elif p_type_code in ["mcq", "quiz"] and len(options_list) < 2:
                             st.error("Please provide at least 2 options for a Multiple Choice question.")
                         else:
+                            if launch_immediately:
+                                supabase.table("live_polls").update({"is_active": False}).eq("course_id", poll_course_id).execute()
+                                ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=timer_sec_val)).isoformat()
+                            else:
+                                ends_iso = None
+                                
                             supabase.table("live_polls").insert({
                                 "course_id": poll_course_id,
+                                "session_title": session_input or "Class Session 1",
+                                "slide_order": int(slide_no_input),
                                 "question_text": q_text,
                                 "poll_type": p_type_code,
                                 "options_json": options_list,
                                 "correct_answer": correct_opt,
                                 "marks": q_marks,
-                                "is_active": launch_now,
-                                "reveal_answer": False
+                                "is_active": launch_immediately,
+                                "show_results": False,
+                                "reveal_answer": False,
+                                "timer_seconds": timer_sec_val,
+                                "timer_ends_at": ends_iso
                             }).execute()
-                            st.success("✅ Question created!")
+                            st.success(f"✅ Slide #{slide_no_input} added to `{session_input}`!")
                             st.rerun()
-                            
+
+                # 3. MENTIMETER SLIDE DECK PRESENTER & CONTROLS
                 st.markdown("---")
-                all_polls = supabase.table("live_polls").select("*").eq("course_id", poll_course_id).order("created_at", desc=True).execute().data
-                
-                if not all_polls:
-                    st.info("No live polls or quizzes created for this course yet. Expand the box above to create one.")
+                if not session_slides:
+                    st.info("No slides in this session yet. Expand the box above to add your first slide.")
                 else:
-                    poll_map = {
-                        f"{'🟢 [OPEN] ' if p['is_active'] else '🔴 [CLOSED] '}[{p['poll_type'].upper()}] {p['question_text']}": p
-                        for p in all_polls
-                    }
-                    sel_poll_label = st.selectbox("Select Question to Present or Manage", list(poll_map.keys()))
-                    curr_poll = poll_map[sel_poll_label]
-                    curr_poll_id = curr_poll['poll_id']
+                    # Determine current slide index in session_slides
+                    slide_idx_key = f"slide_idx_{poll_course_id}_{selected_session}"
+                    active_in_session = [ idx for idx, s in enumerate(session_slides) if s.get("is_active") ]
+                    if slide_idx_key not in st.session_state:
+                        st.session_state[slide_idx_key] = active_in_session[0] if active_in_session else 0
+                    if st.session_state[slide_idx_key] >= len(session_slides):
+                        st.session_state[slide_idx_key] = len(session_slides) - 1
+                        
+                    curr_idx = st.session_state[slide_idx_key]
                     
-                    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
-                    with ctrl1:
-                        if curr_poll['is_active']:
-                            if st.button("🔴 Close Voting", use_container_width=True):
+                    # Slide Selector & Prev / Next Navigation Bar
+                    nav_c1, nav_c2, nav_c3 = st.columns([1, 3, 1])
+                    with nav_c1:
+                        if st.button("⬅️ Previous Slide", disabled=(curr_idx <= 0), use_container_width=True):
+                            new_idx = curr_idx - 1
+                            st.session_state[slide_idx_key] = new_idx
+                            target_slide = session_slides[new_idx]
+                            activate_slide_with_timer(
+                                poll_course_id,
+                                target_slide["poll_id"],
+                                int(target_slide.get("timer_seconds") or 30)
+                            )
+                            st.rerun()
+                    with nav_c2:
+                        slide_labels = [
+                            f"Slide {idx+1}/{len(session_slides)}: {'🟢 [LIVE] ' if s.get('is_active') else ''}[{s['poll_type'].upper()}] {s['question_text']}"
+                            for idx, s in enumerate(session_slides)
+                        ]
+                        chosen_label = st.selectbox(
+                            "Jump to Slide",
+                            slide_labels,
+                            index=curr_idx,
+                            label_visibility="collapsed"
+                        )
+                        selected_idx = slide_labels.index(chosen_label)
+                        if selected_idx != curr_idx:
+                            st.session_state[slide_idx_key] = selected_idx
+                            st.rerun()
+                    with nav_c3:
+                        if st.button("Next Slide ➡️", disabled=(curr_idx >= len(session_slides) - 1), use_container_width=True, type="primary"):
+                            new_idx = curr_idx + 1
+                            st.session_state[slide_idx_key] = new_idx
+                            target_slide = session_slides[new_idx]
+                            activate_slide_with_timer(
+                                poll_course_id,
+                                target_slide["poll_id"],
+                                int(target_slide.get("timer_seconds") or 30)
+                            )
+                            st.rerun()
+
+                    curr_poll = session_slides[st.session_state[slide_idx_key]]
+                    curr_poll_id = curr_poll["poll_id"]
+                    saved_timer_sec = int(curr_poll.get("timer_seconds") or 30)
+                    if saved_timer_sec not in [30, 60, 90]:
+                        saved_timer_sec = 30
+
+                    # Presenter Control Bar: Timer Duration, Launch/Close, Show/Hide Results, Reveal Answer, Delete
+                    bar1, bar2, bar3, bar4, bar5 = st.columns([1.4, 1.4, 1.4, 1.4, 1])
+                    with bar1:
+                        live_timer_sel = st.selectbox(
+                            "Timer Duration",
+                            [30, 60, 90],
+                            index=[30, 60, 90].index(saved_timer_sec),
+                            format_func=lambda x: f"⏱️ Timer: {x} sec",
+                            key=f"timer_sel_{curr_poll_id}",
+                            label_visibility="collapsed"
+                        )
+                    with bar2:
+                        if curr_poll.get("is_active"):
+                            if st.button("🔴 Stop Voting Now", use_container_width=True):
                                 supabase.table("live_polls").update({"is_active": False}).eq("poll_id", curr_poll_id).execute()
                                 st.rerun()
                         else:
-                            if st.button("🟢 Open Voting", use_container_width=True):
-                                supabase.table("live_polls").update({"is_active": True}).eq("poll_id", curr_poll_id).execute()
+                            if st.button(f"🟢 Start Voting ({live_timer_sel}s)", use_container_width=True, type="primary"):
+                                activate_slide_with_timer(poll_course_id, curr_poll_id, live_timer_sel)
                                 st.rerun()
-                    with ctrl2:
-                        if curr_poll['poll_type'] == 'quiz':
-                            if curr_poll.get('reveal_answer'):
-                                if st.button("🙈 Hide Correct Answer", use_container_width=True):
+                    with bar3:
+                        if curr_poll.get("show_results"):
+                            if st.button("🙈 Hide Results", use_container_width=True):
+                                supabase.table("live_polls").update({"show_results": False}).eq("poll_id", curr_poll_id).execute()
+                                st.rerun()
+                        else:
+                            if st.button("📊 Show Results", use_container_width=True):
+                                supabase.table("live_polls").update({"show_results": True}).eq("poll_id", curr_poll_id).execute()
+                                st.rerun()
+                    with bar4:
+                        if curr_poll["poll_type"] == "quiz":
+                            if curr_poll.get("reveal_answer"):
+                                if st.button("🙈 Hide Answer", use_container_width=True):
                                     supabase.table("live_polls").update({"reveal_answer": False}).eq("poll_id", curr_poll_id).execute()
                                     st.rerun()
                             else:
                                 if st.button("👁️ Reveal Correct Answer", use_container_width=True):
-                                    supabase.table("live_polls").update({"reveal_answer": True}).eq("poll_id", curr_poll_id).execute()
+                                    supabase.table("live_polls").update({"reveal_answer": True, "show_results": True}).eq("poll_id", curr_poll_id).execute()
                                     st.rerun()
-                    with ctrl3:
-                        if st.button("🔄 Refresh Live Chart", use_container_width=True):
-                            st.rerun()
-                    with ctrl4:
-                        if st.button("🗑️ Delete Question", use_container_width=True):
+                        else:
+                            if st.button("🔄 Refresh Screen", use_container_width=True):
+                                st.rerun()
+                    with bar5:
+                        if st.button("🗑️ Delete Slide", use_container_width=True):
                             supabase.table("live_polls").delete().eq("poll_id", curr_poll_id).execute()
                             st.rerun()
 
-                    @st.fragment(run_every="3s" if curr_poll['is_active'] else None)
-                    def render_live_projector_results(poll_obj):
-                        resps = supabase.table("poll_responses").select("*").eq("poll_id", poll_obj['poll_id']).execute().data
-                        roster_count_res = supabase.table("students").select("student_id").eq("course_id", poll_course_id).execute().data
-                        total_enrolled = len(roster_count_res) if roster_count_res else 0
+                    # 4. AUTO-REFRESHING PROJECTOR CANVAS
+                    @st.fragment(run_every="2s" if curr_poll.get("is_active") else None)
+                    def render_live_projector_canvas(poll_id_arg, total_slides_in_deck, slide_Position):
+                        fresh_poll = supabase.table("live_polls").select("*").eq("poll_id", poll_id_arg).single().execute().data
+                        resps = supabase.table("poll_responses").select("*").eq("poll_id", poll_id_arg).execute().data or []
+                        roster_list = supabase.table("students").select("reg_no, student_name, email").eq("course_id", poll_course_id).order("reg_no").execute().data or []
+                        total_enrolled = len(roster_list)
                         
-                        st.markdown(f"## 📢 {poll_obj['question_text']}")
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Locked Responses Received", f"{len(resps)} / {total_enrolled if total_enrolled else '?'}")
-                        m2.metric("Voting Status", "🟢 OPEN (Auto-Refreshing)" if poll_obj['is_active'] else "🔴 CLOSED")
-                        if poll_obj['poll_type'] == 'quiz':
-                            correct_cnt = sum(1 for r in resps if r.get('is_correct'))
-                            m3.metric("Correct Responses", f"{correct_cnt} / {len(resps)}" if poll_obj.get('reveal_answer') else "Hidden until revealed")
+                        rem_s = get_remaining_seconds(fresh_poll)
+                        t_total = int(fresh_poll.get("timer_seconds") or 30)
+                        
+                        with st.container(border=True):
+                            st.caption(f"🎯 **{fresh_poll.get('session_title', 'Session')} — Slide {slide_Position} of {total_slides_in_deck}**")
+                            st.markdown(f"## 📢 {fresh_poll['question_text']}")
                             
-                        if poll_obj['poll_type'] in ['mcq', 'quiz']:
-                            opts = poll_obj.get('options_json') or []
-                            counts = {o: 0 for o in opts}
-                            for r in resps:
-                                ans = r.get('response_text')
-                                if ans in counts:
-                                    counts[ans] += 1
-                                elif ans:
-                                    counts[ans] = counts.get(ans, 0) + 1
-                                    
-                            chart_df = pd.DataFrame({
-                                "Option": list(counts.keys()),
-                                "Votes": list(counts.values())
-                            })
-                            st.bar_chart(chart_df.set_index("Option"), height=320)
-                            
-                            if poll_obj['poll_type'] == 'quiz' and poll_obj.get('reveal_answer'):
-                                st.success(f"✅ **Correct Answer:** `{poll_obj.get('correct_answer')}` ({poll_obj.get('marks', 1.0)} Marks)")
-                        else:
-                            words = [r.get('response_text', '') for r in resps]
-                            render_visual_wordcloud(words)
-                            
-                        if resps:
-                            with st.expander("📋 View Individual Student Responses & Export to Excel"):
-                                df_r = pd.DataFrame(resps)[["reg_no", "student_name", "response_text", "is_correct", "marks_awarded", "submitted_at"]]
-                                df_r.columns = ["Reg No", "Student Name", "Submitted Response", "Is Correct", "Marks Awarded", "Timestamp"]
-                                st.dataframe(df_r, use_container_width=True, hide_index=True)
-                                
-                                poll_excel_buf = io.BytesIO()
-                                with pd.ExcelWriter(poll_excel_buf, engine='openpyxl') as writer:
-                                    df_r.to_excel(writer, index=False, sheet_name="Poll_Responses")
-                                poll_excel_buf.seek(0)
-                                
-                                st.download_button(
-                                    label="📥 Download Question Responses & Marks (.xlsx)",
-                                    data=poll_excel_buf,
-                                    file_name=f"{selected_poll_c_code}_Poll_Responses.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key=f"dl_poll_{poll_obj['poll_id']}"
+                            # Top Metrics & Live Countdown Bar
+                            pm1, pm2, pm3 = st.columns(3)
+                            pm1.metric("🔒 Locked Student Responses", f"{len(resps)} / {total_enrolled if total_enrolled else '?'}")
+                            if fresh_poll.get("is_active") and rem_s is not None and rem_s > 0:
+                                pm2.metric("⏱️ Countdown Timer", f"{rem_s} sec remaining")
+                                st.progress(min(max(rem_s / float(t_total), 0.0), 1.0))
+                            else:
+                                pm2.metric("⏱️ Voting Status", "🔴 Voting Closed / Time Up" if rem_s == 0 or not fresh_poll.get("is_active") else "🟢 Open")
+                            pm3.metric("📊 Results Visibility", "📊 Shown on Projector" if fresh_poll.get("show_results") else "🙈 Hidden Until Clicked")
+
+                            # Show Large Readable Option Cards on Projector
+                            if fresh_poll["poll_type"] in ["mcq", "quiz"]:
+                                render_projector_option_cards(
+                                    fresh_poll.get("options_json") or [],
+                                    correct_answer=fresh_poll.get("correct_answer"),
+                                    reveal_answer=bool(fresh_poll.get("reveal_answer"))
                                 )
 
-                    render_live_projector_results(curr_poll)
+                            st.markdown("---")
+                            # Hidden vs Revealed Results Logic (Option 1)
+                            if not fresh_poll.get("show_results"):
+                                st.info(
+                                    "🙈 **Live Results Are Hidden:** Students are currently submitting answers independently. "
+                                    "Click **📊 Show Results** above when you are ready to display the class distribution on the projector."
+                                )
+                            else:
+                                if fresh_poll["poll_type"] in ["mcq", "quiz"]:
+                                    opts = fresh_poll.get("options_json") or []
+                                    counts = {o: 0 for o in opts}
+                                    for r in resps:
+                                        ans = r.get("response_text")
+                                        if ans in counts:
+                                            counts[ans] += 1
+                                        elif ans:
+                                            counts[ans] = counts.get(ans, 0) + 1
+                                            
+                                    chart_df = pd.DataFrame({
+                                        "Option": list(counts.keys()),
+                                        "Student Votes": list(counts.values())
+                                    })
+                                    st.bar_chart(chart_df.set_index("Option"), height=300)
+                                    
+                                    if fresh_poll["poll_type"] == "quiz" and fresh_poll.get("reveal_answer"):
+                                        correct_cnt = sum(1 for r in resps if r.get("is_correct"))
+                                        st.success(
+                                            f"✅ **Correct Answer:** `{fresh_poll.get('correct_answer')}` "
+                                            f"| **{correct_cnt} of {len(resps)}** students answered correctly ({fresh_poll.get('marks', 1.0)} Marks)."
+                                        )
+                                else:
+                                    words = [r.get("response_text", "") for r in resps]
+                                    render_visual_wordcloud(words)
+
+                    render_live_projector_canvas(curr_poll_id, len(session_slides), st.session_state[slide_idx_key] + 1)
+
+                    # 5. FULL-ROSTER ATTENDANCE & QUESTION-BY-QUESTION EXCEL EXPORT (Option 4)
+                    st.markdown("---")
+                    st.subheader(f"📥 Full-Roster Attendance & Question-by-Question Report (`{selected_session}`)")
+                    
+                    roster_students = (
+                        supabase.table("students")
+                        .select("reg_no, student_name, email")
+                        .eq("course_id", poll_course_id)
+                        .order("reg_no")
+                        .execute()
+                        .data or []
+                    )
+                    session_poll_ids = [s["poll_id"] for s in session_slides]
+                    all_session_resps = []
+                    if session_poll_ids:
+                        all_session_resps = (
+                            supabase.table("poll_responses")
+                            .select("*")
+                            .in_("poll_id", session_poll_ids)
+                            .execute()
+                            .data or []
+                        )
+                        
+                    # Map responses by (reg_no, poll_id)
+                    resp_lookup = {}
+                    for r in all_session_resps:
+                        resp_lookup[(str(r["reg_no"]).strip().upper(), r["poll_id"])] = r
+                        
+                    # Include any student who voted even if roster was updated later
+                    roster_reg_set = {str(s["reg_no"]).strip().upper() for s in roster_students}
+                    combined_students = list(roster_students)
+                    for r in all_session_resps:
+                        r_reg = str(r["reg_no"]).strip().upper()
+                        if r_reg not in roster_reg_set:
+                            combined_students.append({
+                                "reg_no": r_reg,
+                                "student_name": r.get("student_name", ""),
+                                "email": ""
+                            })
+                            roster_reg_set.add(r_reg)
+                            
+                    summary_rows = []
+                    response_matrix_rows = []
+                    total_possible_quiz_marks = sum(
+                        float(s.get("marks", 0.0)) for s in session_slides if s["poll_type"] == "quiz"
+                    )
+                    
+                    for stu in combined_students:
+                        reg = str(stu["reg_no"]).strip().upper()
+                        name = stu["student_name"]
+                        
+                        slides_answered = 0
+                        student_quiz_total = 0.0
+                        
+                        s_row = {
+                            "Reg No": reg,
+                            "Student Name": name,
+                        }
+                        m_row = {
+                            "Reg No": reg,
+                            "Student Name": name,
+                        }
+                        
+                        for idx_s, s_obj in enumerate(session_slides):
+                            s_id = s_obj["poll_id"]
+                            q_num = f"Q{idx_s + 1}"
+                            short_q = s_obj["question_text"][:28] + ("..." if len(s_obj["question_text"]) > 28 else "")
+                            r_match = resp_lookup.get((reg, s_id))
+                            
+                            if r_match:
+                                slides_answered += 1
+                                ans_text = r_match.get("response_text", "")
+                                m_awarded = float(r_match.get("marks_awarded", 0.0))
+                            else:
+                                ans_text = "—"
+                                m_awarded = 0.0
+                                
+                            if s_obj["poll_type"] == "quiz":
+                                col_hdr = f"{q_num} Marks (/{s_obj.get('marks', 1.0)})"
+                                s_row[col_hdr] = m_awarded
+                                student_quiz_total += m_awarded
+                            else:
+                                col_hdr = f"{q_num} ({s_obj['poll_type'].upper()})"
+                                s_row[col_hdr] = "Voted" if r_match else "Absent"
+                                
+                            m_row[f"{q_num}: {short_q}"] = ans_text
+                            
+                        attendance_status = "Present" if slides_answered > 0 else "Absent"
+                        s_row["Attendance"] = attendance_status
+                        s_row["Slides Answered"] = f"{slides_answered} / {len(session_slides)}"
+                        s_row[f"Total Quiz Score (/{total_possible_quiz_marks})"] = round(student_quiz_total, 2)
+                        
+                        m_row["Attendance"] = attendance_status
+                        m_row["Slides Answered"] = f"{slides_answered} / {len(session_slides)}"
+                        
+                        summary_rows.append(s_row)
+                        response_matrix_rows.append(m_row)
+                        
+                    if summary_rows:
+                        df_summary = pd.DataFrame(summary_rows)
+                        # Reorder columns cleanly: Reg No, Student Name, Attendance, Slides Answered, Q1..Qn, Total
+                        fixed_first = ["Reg No", "Student Name", "Attendance", "Slides Answered"]
+                        other_cols = [c for c in df_summary.columns if c not in fixed_first]
+                        df_summary = df_summary[fixed_first + other_cols]
+                        
+                        df_matrix = pd.DataFrame(response_matrix_rows)
+                        fixed_m_first = ["Reg No", "Student Name", "Attendance", "Slides Answered"]
+                        other_m_cols = [c for c in df_matrix.columns if c not in fixed_m_first]
+                        df_matrix = df_matrix[fixed_m_first + other_m_cols]
+                        
+                        with st.expander("📋 Preview Full-Roster Attendance & Question-by-Question Table"):
+                            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+                            
+                        session_excel_buf = io.BytesIO()
+                        with pd.ExcelWriter(session_excel_buf, engine="openpyxl") as writer:
+                            df_summary.to_excel(writer, index=False, sheet_name="Attendance_And_Marks")
+                            df_matrix.to_excel(writer, index=False, sheet_name="Detailed_Student_Answers")
+                        session_excel_buf.seek(0)
+                        
+                        clean_sess_fname = selected_session.replace(" ", "_")
+                        st.download_button(
+                            label=f"📥 Download Full-Roster Attendance & Question-by-Question Excel ({selected_session}.xlsx)",
+                            data=session_excel_buf,
+                            file_name=f"{selected_poll_c_code}_{clean_sess_fname}_Attendance_And_Quiz_Marks.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
