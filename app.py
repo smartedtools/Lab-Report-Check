@@ -216,7 +216,7 @@ def parse_uploaded_rubric_file(uploaded_file):
     col_mapping = {}
     for col in df.columns:
         c_low = str(col).strip().lower()
-        if "crit" in c_low or "head" in c_low or "title" in c_low:
+        if "crit" in c_low or "head" in c_low or "title" in c_low or "exp" in c_low:
             col_mapping[col] = "criterion"
         elif "mark" in c_low or "weight" in c_low or "score" in c_low:
             col_mapping[col] = "max_marks"
@@ -360,6 +360,7 @@ def upload_or_update_file(file_bytes, file_name, mime_type, parent_ref, existing
         except Exception as e:
             if attempt == max_retries - 1:
                 raise e
+            time.sleep(2)
 
 def download_file_bytes_from_drive(target_ref):
     req_kwargs = {PARAM_FILE_KEY: target_ref}
@@ -373,11 +374,12 @@ def download_file_bytes_from_drive(target_ref):
     return fh.read()
 
 def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title, exp_guidelines, total_marks, is_combined=False):
+    num_criteria = len(rubric_json)
     task_desc = (
-        "This is a COMPREHENSIVE or COMBINED report (containing multiple labs/experiments or a full Design Report) compiled into a single PDF. "
-        "Locate each individual experiment or design section within the document, evaluate them against the 4-point Likert scale rubric criteria, and provide a structured breakdown for each criterion."
+        "This is a COMPREHENSIVE or COMBINED lab manual/report (containing multiple experiments or a full Design Report) compiled into a single PDF. "
+        "Carefully inspect ALL pages and experiments across the entire PDF document, evaluate the student's work against EVERY SINGLE criterion in the rubric, and provide a complete breakdown."
         if is_combined else 
-        "Thoroughly inspect the attached student lab report PDF (reading observation tables, formulas, calculations, figures, and discussion) and evaluate against the 4-point Likert scale rubric."
+        "Thoroughly inspect all pages of the attached student lab report PDF (reading observation tables, formulas, calculations, figures, and discussion) and evaluate against EVERY SINGLE criterion in the 4-point Likert scale rubric."
     )
 
     prompt = f"""
@@ -388,23 +390,23 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
     Instructor Guidelines & Focus Notes:
     {exp_guidelines if exp_guidelines else "Evaluate based on technical accuracy, valid observation tables, correct calculations, and scientific discussion."}
     
-    Here is the 4-Point Likert Scale Analytic Rubric (4 = Excellent, 3 = Proficient, 2 = Developing, 1 = Needs Improvement):
+    Here is the 4-Point Likert Scale Analytic Rubric containing {num_criteria} required criteria (4 = Excellent, 3 = Proficient, 2 = Developing, 1 = Needs Improvement):
     {json.dumps(rubric_json, indent=2)}
     
-    Scoring Instructions:
+    CRITICAL SCORING INSTRUCTIONS:
     1. {task_desc}
-    2. Use the exact "criterion" names from the Rubric above.
-    3. For each criterion, compare the student's work to the descriptors in `level_4`, `level_3`, `level_2`, and `level_1`.
+    2. Your `criteria_scores` array MUST contain EXACTLY {num_criteria} items—one for each criterion in the rubric above, using the exact "criterion" names provided. NEVER skip, merge, or omit any criterion.
+    3. For each criterion, compare the student's work to `level_4`, `level_3`, `level_2`, and `level_1`.
     4. Assign a `likert_rating` (integer 4, 3, 2, or 1) and the corresponding `rating_label`:
        - "4 - Excellent"
        - "3 - Proficient"
        - "2 - Developing"
        - "1 - Needs Improvement"
-    5. Calculate `marks_awarded` as: `(likert_rating / 4.0) * max_marks` (so if `max_marks` is 4.0, `marks_awarded` equals `likert_rating`).
-    6. In `feedback`, clearly state WHY the student received that Likert level (referencing specific strengths or missing details in their report) so the student understands their mark.
-    7. Ensure `ai_total_score` equals the exact sum of `marks_awarded` across all criteria.
+    5. Calculate `marks_awarded` as: `(likert_rating / 4.0) * max_marks`.
+    6. In `feedback`, clearly state WHY the student received that Likert level.
+    7. Ensure `ai_total_score` equals the exact sum of `marks_awarded` across all {num_criteria} criteria.
     
-    You MUST return your final evaluation strictly in valid JSON format with this exact structure:
+    Return strictly valid JSON with this exact structure:
     {{
       "criteria_scores": [
         {{
@@ -413,20 +415,26 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
           "rating_label": "3 - Proficient",
           "marks_awarded": 3.0,
           "max_marks": 4.0,
-          "feedback": "Specific constructive feedback explaining why this earned 3 (Proficient) and what was missing for 4 (Excellent)."
+          "feedback": "Specific constructive feedback explaining why this earned 3 (Proficient)."
         }}
       ],
       "ai_total_score": 32.0,
-      "overall_feedback": "Summary statement on the student's performance, strengths, and areas of improvement."
+      "overall_feedback": "Summary statement on the student's performance across the manual/report."
     }}
     """
     
     pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-    models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.8-pro"]
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-1.5-flash"
+    ]
     
     last_error = None
     for model_name in models_to_try:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 response = gemini_client.models.generate_content(
                     model=model_name,
@@ -435,10 +443,44 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
                         response_mime_type="application/json",
                     ),
                 )
-                return json.loads(response.text)
+                parsed = json.loads(response.text)
+                
+                # Enforce that all rubric criteria are present in the returned JSON
+                returned_map = {
+                    str(c.get("criterion", "")).strip().lower(): c
+                    for c in (parsed.get("criteria_scores") or [])
+                }
+                complete_scores = []
+                for idx_r, r_item in enumerate(rubric_json):
+                    c_name = str(r_item["criterion"]).strip()
+                    max_m = float(r_item["max_marks"])
+                    matched = returned_map.get(c_name.lower())
+                    if not matched and idx_r < len(parsed.get("criteria_scores", [])):
+                        matched = parsed["criteria_scores"][idx_r]
+                    if matched:
+                        matched["criterion"] = c_name
+                        matched["max_marks"] = max_m
+                        complete_scores.append(matched)
+                    else:
+                        complete_scores.append({
+                            "criterion": c_name,
+                            "likert_rating": 1,
+                            "rating_label": "1 - Needs Improvement",
+                            "marks_awarded": round(0.25 * max_m, 2),
+                            "max_marks": max_m,
+                            "feedback": "Section missing or not clearly identifiable in the submitted PDF."
+                        })
+                parsed["criteria_scores"] = complete_scores
+                parsed["ai_total_score"] = round(sum(float(x.get("marks_awarded", 0.0)) for x in complete_scores), 2)
+                return parsed
             except Exception as e:
                 last_error = e
-                time.sleep(2)
+                err_str = str(e).lower()
+                # If rate-limited (429 / quota), wait longer before retrying
+                if "429" in err_str or "quota" in err_str or "exhausted" in err_str:
+                    time.sleep(12 * (attempt + 1))
+                else:
+                    time.sleep(2)
                 
     raise last_error
 
@@ -796,7 +838,6 @@ elif portal_mode == "Instructor / Admin Login":
 
         st.markdown("---")
         
-        # Render buttons in clean rows of 3
         chunked_options = [nav_options[i:i + 3] for i in range(0, len(nav_options), 3)]
         for row in chunked_options:
             cols = st.columns(3)
@@ -1068,9 +1109,9 @@ elif portal_mode == "Instructor / Admin Login":
                 with col_e1:
                     exp_no = st.number_input("Assessment Number / ID", min_value=1, step=1)
                 with col_e2:
-                    exp_title = st.text_input("Assessment Title * (e.g., Exp 1: pH & Turbidity or Labs 1-6 Combined)").strip()
+                    exp_title = st.text_input("Assessment Title * (e.g., Exp 1: pH & Turbidity or Labs 1-11 Combined)").strip()
                 
-                is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Packet or Design Report?", value=False)
+                is_combined = st.checkbox("📦 Is this a Combined Multi-Lab Manual or Design Report?", value=False)
                 is_open = st.checkbox("🔓 Accepting Submissions (Open)", value=True)
                 exp_guidelines = st.text_area("Optional Guidelines for AI Evaluator", placeholder="e.g., Verify mass balance equations and APHA standard compliance.")
                 
@@ -1079,7 +1120,7 @@ elif portal_mode == "Instructor / Admin Login":
                 
                 edited_exp_rubric = None
                 if not use_custom_rubric:
-                    st.info("ℹ️ This assessment will automatically use the **Course Default Likert Rubric** configured in Tab 1.")
+                    st.info("ℹ️ This assessment will automatically use the **Course Default Likert Rubric** configured in Course & Rubric.")
                 else:
                     st.markdown("#### Custom Likert Rubric Setup (Upload CSV/Excel or Edit Below)")
                     col_r_dl, col_r_up = st.columns([1, 2])
@@ -1104,11 +1145,14 @@ elif portal_mode == "Instructor / Admin Login":
                             st.success(f"✅ Loaded {len(default_custom_rubric_df)} custom criteria from `{uploaded_exp_rubric_file.name}`!")
                         except Exception as e:
                             st.error(f"Error reading uploaded rubric file: {e}")
-                            default_custom_rubric_df = pd.DataFrame(DEFAULT_DESIGN_LIKERT_RUBRIC)
+                            default_custom_rubric_df = pd.DataFrame(DEFAULT_LAB_LIKERT_RUBRIC)
                     else:
                         template_choice = st.radio(
                             "Or choose a starting template to edit manually:",
-                            ["5-Criterion Engineering Design Rubric (20 Marks)", "10-Criterion Standard Lab Rubric (40 Marks)"],
+                            [
+                                "10-Criterion Standard Lab Rubric (40 Marks)",
+                                "5-Criterion Engineering Design Rubric (20 Marks)"
+                            ],
                             horizontal=True,
                             key="exp_template_radio"
                         )
@@ -1162,7 +1206,7 @@ elif portal_mode == "Instructor / Admin Login":
                 st.info("Please set up a course first.")
 
         # ==========================================
-        # SECTION 5: GRADING & EXPORT
+        # SECTION 5: GRADING & EXPORT (FULL INCREMENTAL + ALL STUDENTS)
         # ==========================================
         elif chosen_tab == "📊 Grading & Export":
             st.subheader("Batch AI Grading Engine & Likert Scale Gradebook")
@@ -1183,196 +1227,230 @@ elif portal_mode == "Instructor / Admin Login":
                     active_rubric = exp_info['custom_rubric_json'] if exp_info.get('custom_rubric_json') else course_info['rubric_json']
                     active_total_marks = round(sum([float(item['max_marks']) for item in active_rubric]), 2)
                     
-                    with st.expander(f"📋 View Active 4-Point Likert Rubric for this Assessment (Total: {active_total_marks} Marks)"):
+                    with st.expander(f"📋 View Active 4-Point Likert Rubric ({len(active_rubric)} Criteria | Total: {active_total_marks} Marks)"):
                         st.dataframe(format_rubric_for_display(active_rubric), use_container_width=True, hide_index=True)
                     
-                    subs_res = supabase.table("submissions").select("*").eq("exp_id", exp_info['exp_id']).execute()
-                    submissions = subs_res.data
+                    subs_res = supabase.table("submissions").select("*").eq("exp_id", exp_info['exp_id']).order("reg_no").execute()
+                    submissions = subs_res.data or []
                     
-                    st.write(f"Total Student Submissions Found: **{len(submissions)}**")
+                    sub_ids = [s['sub_id'] for s in submissions]
+                    evals_map = {}
+                    if sub_ids:
+                        evals_query = supabase.table("evaluations").select("*").in_("sub_id", sub_ids).execute()
+                        for ev in (evals_query.data or []):
+                            evals_map[ev['sub_id']] = ev
+                            
+                    pending_subs = [s for s in submissions if s['sub_id'] not in evals_map or s.get('status') != 'graded']
+                    graded_count = len(submissions) - len(pending_subs)
+                    
+                    m_col1, m_col2, m_col3 = st.columns(3)
+                    m_col1.metric("Total Manuals Submitted", len(submissions))
+                    m_col2.metric("✅ Graded in Analysis", graded_count)
+                    m_col3.metric("⏳ Pending / Needs AI Grading", len(pending_subs))
                     
                     if submissions:
-                        if st.button("🚀 Run AI Batch Grading for All Submissions", key="btn_run_batch_grading"):
-                            progress_bar = st.progress(0)
-                            status_box = st.empty()
-                            
-                            for idx, sub in enumerate(submissions):
-                                status_box.info(f"⏳ Processing ({idx+1}/{len(submissions)}): {sub['student_name']} ({sub['reg_no']})...")
-                                try:
-                                    pdf_bytes = download_file_bytes_from_drive(sub[COL_DRIVE_FILE])
-                                    
-                                    eval_result = evaluate_report_with_gemini(
-                                        pdf_bytes=pdf_bytes,
-                                        rubric_json=active_rubric,
-                                        course_title=course_info['course_title'],
-                                        exp_title=exp_info['exp_title'],
-                                        exp_guidelines=exp_info['exp_guidelines'],
-                                        total_marks=active_total_marks,
-                                        is_combined=exp_info.get('is_combined', False)
-                                    )
-                                    
-                                    supabase.table("evaluations").upsert({
-                                        "sub_id": sub['sub_id'],
-                                        "criteria_scores_json": eval_result['criteria_scores'],
-                                        "ai_total_score": eval_result['ai_total_score'],
-                                        "final_total_score": eval_result['ai_total_score'],
-                                        "overall_feedback": eval_result['overall_feedback']
-                                    }, on_conflict="sub_id").execute()
-                                    
-                                    supabase.table("submissions").update({"status": "graded"}).eq("sub_id", sub['sub_id']).execute()
-                                    st.toast(f"✅ Graded {sub['reg_no']}: {eval_result['ai_total_score']}/{active_total_marks}")
-                                    
-                                except Exception as e:
-                                    st.error(f"❌ Error grading {sub['reg_no']}: {e}")
+                        only_ungraded = st.checkbox(
+                            "⚡ Grade ONLY Pending / Un-evaluated Manuals (Recommended — skips already-graded reports to avoid API quota limits)",
+                            value=True
+                        )
+                        target_queue = pending_subs if only_ungraded else submissions
+                        
+                        if st.button(f"🚀 Run AI Grading ({len(target_queue)} Manuals in Queue)", type="primary", key="btn_run_batch_grading"):
+                            if not target_queue:
+                                st.info("All submitted manuals are already graded! Uncheck the box above if you wish to re-grade all from scratch.")
+                            else:
+                                progress_bar = st.progress(0)
+                                status_box = st.empty()
                                 
-                                progress_bar.progress((idx + 1) / len(submissions))
+                                for idx, sub in enumerate(target_queue):
+                                    status_box.info(f"⏳ Grading ({idx+1}/{len(target_queue)}): **{sub['student_name']}** (`{sub['reg_no']}`)...")
+                                    try:
+                                        pdf_bytes = download_file_bytes_from_drive(sub[COL_DRIVE_FILE])
+                                        
+                                        eval_result = evaluate_report_with_gemini(
+                                            pdf_bytes=pdf_bytes,
+                                            rubric_json=active_rubric,
+                                            course_title=course_info['course_title'],
+                                            exp_title=exp_info['exp_title'],
+                                            exp_guidelines=exp_info['exp_guidelines'],
+                                            total_marks=active_total_marks,
+                                            is_combined=exp_info.get('is_combined', False)
+                                        )
+                                        
+                                        supabase.table("evaluations").upsert({
+                                            "sub_id": sub['sub_id'],
+                                            "criteria_scores_json": eval_result['criteria_scores'],
+                                            "ai_total_score": eval_result['ai_total_score'],
+                                            "final_total_score": eval_result['ai_total_score'],
+                                            "overall_feedback": eval_result['overall_feedback']
+                                        }, on_conflict="sub_id").execute()
+                                        
+                                        supabase.table("submissions").update({"status": "graded"}).eq("sub_id", sub['sub_id']).execute()
+                                        st.toast(f"✅ Graded {sub['reg_no']}: {eval_result['ai_total_score']}/{active_total_marks}")
+                                        
+                                        # 4-second pacing delay between manuals to prevent Gemini RPM/TPM quota limits
+                                        if idx < len(target_queue) - 1:
+                                            time.sleep(4)
+                                            
+                                    except Exception as e:
+                                        st.error(f"❌ Error grading {sub['reg_no']} ({sub['student_name']}): {e}")
+                                    
+                                    progress_bar.progress((idx + 1) / len(target_queue))
+                                    
+                                status_box.success("✅ Batch grading run completed!")
+                                time.sleep(1)
+                                st.rerun()
                                 
-                            status_box.success("✅ Batch grading finished successfully!")
-                            st.rerun()
-                            
                         st.markdown("---")
-                        st.subheader("Graded Results & Criterion-Wise Likert Review")
+                        st.subheader(f"Graded Analysis & Criterion-Wise Likert Review (All {len(submissions)} Submissions)")
                         
-                        sub_ids = [s['sub_id'] for s in submissions]
-                        evals_query = supabase.table("evaluations").select("*, submissions(reg_no, student_name, file_name, status, sub_id)").in_("sub_id", sub_ids).execute()
-                        
-                        if evals_query.data:
-                            rubric_col_map = {}
-                            rubric_lookup = {}
-                            ordered_criterion_cols = []
-                            for r_item in active_rubric:
-                                c_name = str(r_item['criterion']).strip()
-                                col_label = f"{c_name} (/{r_item['max_marks']})"
-                                rubric_col_map[c_name.lower()] = col_label
-                                rubric_lookup[c_name.lower()] = r_item
-                                ordered_criterion_cols.append(col_label)
-                                
-                            eval_df_data = []
-                            detailed_feedback_rows = []
-                            extra_criterion_cols = []
+                        rubric_col_map = {}
+                        rubric_lookup = {}
+                        ordered_criterion_cols = []
+                        for r_item in active_rubric:
+                            c_name = str(r_item['criterion']).strip()
+                            col_label = f"{c_name} (/{r_item['max_marks']})"
+                            rubric_col_map[c_name.lower()] = col_label
+                            rubric_lookup[c_name.lower()] = r_item
+                            ordered_criterion_cols.append(col_label)
                             
-                            for ev in evals_query.data:
-                                if ev.get('submissions'):
-                                    reg_no_val = ev['submissions']['reg_no']
-                                    student_name_val = ev['submissions']['student_name']
+                        eval_df_data = []
+                        detailed_feedback_rows = []
+                        extra_criterion_cols = []
+                        
+                        # Loop over ALL submissions so no student is ever missing from the analysis table
+                        for sub in submissions:
+                            s_id = sub['sub_id']
+                            reg_no_val = sub['reg_no']
+                            student_name_val = sub['student_name']
+                            ev = evals_map.get(s_id)
+                            
+                            row_dict = {
+                                "sub_id": s_id,
+                                "Reg No": reg_no_val,
+                                "Student Name": student_name_val,
+                                "Status": "✅ Graded" if ev else "⏳ Pending AI Grading"
+                            }
+                            for col_label in ordered_criterion_cols:
+                                row_dict[col_label] = 0.0
+                                
+                            if ev:
+                                crit_list = ev.get('criteria_scores_json') or []
+                                for idx_c, c_obj in enumerate(crit_list):
+                                    raw_c_name = str(c_obj.get('criterion', f'Criterion {idx_c+1}')).strip()
+                                    awarded = float(c_obj.get('marks_awarded', 0.0))
+                                    max_m = float(c_obj.get('max_marks', 4.0))
+                                    likert_val = c_obj.get('likert_rating', int(round((awarded / max_m) * 4)) if max_m > 0 else 1)
+                                    r_label = str(c_obj.get('rating_label', f"{likert_val} / 4"))
+                                    c_fb = str(c_obj.get('feedback', ''))
                                     
-                                    row_dict = {
-                                        "sub_id": ev['sub_id'],
+                                    r_def = rubric_lookup.get(raw_c_name.lower(), {})
+                                    matched_desc = r_def.get(f"level_{likert_val}", "")
+                                    
+                                    matched_col = rubric_col_map.get(raw_c_name.lower())
+                                    if not matched_col and idx_c < len(ordered_criterion_cols) and len(crit_list) == len(ordered_criterion_cols):
+                                        matched_col = ordered_criterion_cols[idx_c]
+                                        
+                                    if matched_col:
+                                        row_dict[matched_col] = awarded
+                                    else:
+                                        dyn_col = f"{raw_c_name} (/{max_m})" if max_m > 0 else raw_c_name
+                                        row_dict[dyn_col] = awarded
+                                        if dyn_col not in extra_criterion_cols:
+                                            extra_criterion_cols.append(dyn_col)
+                                            
+                                    detailed_feedback_rows.append({
                                         "Reg No": reg_no_val,
                                         "Student Name": student_name_val,
-                                    }
-                                    for col_label in ordered_criterion_cols:
-                                        row_dict[col_label] = 0.0
-                                        
-                                    crit_list = ev.get('criteria_scores_json') or []
-                                    for idx_c, c_obj in enumerate(crit_list):
-                                        raw_c_name = str(c_obj.get('criterion', f'Criterion {idx_c+1}')).strip()
-                                        awarded = float(c_obj.get('marks_awarded', 0.0))
-                                        max_m = float(c_obj.get('max_marks', 4.0))
-                                        likert_val = c_obj.get('likert_rating', int(round((awarded / max_m) * 4)) if max_m > 0 else 1)
-                                        r_label = str(c_obj.get('rating_label', f"{likert_val} / 4"))
-                                        c_fb = str(c_obj.get('feedback', ''))
-                                        
-                                        r_def = rubric_lookup.get(raw_c_name.lower(), {})
-                                        matched_desc = r_def.get(f"level_{likert_val}", "")
-                                        
-                                        matched_col = rubric_col_map.get(raw_c_name.lower())
-                                        if not matched_col and idx_c < len(ordered_criterion_cols) and len(crit_list) == len(ordered_criterion_cols):
-                                            matched_col = ordered_criterion_cols[idx_c]
-                                            
-                                        if matched_col:
-                                            row_dict[matched_col] = awarded
-                                        else:
-                                            dyn_col = f"{raw_c_name} (/{max_m})" if max_m > 0 else raw_c_name
-                                            row_dict[dyn_col] = awarded
-                                            if dyn_col not in extra_criterion_cols:
-                                                extra_criterion_cols.append(dyn_col)
-                                                
-                                        detailed_feedback_rows.append({
-                                            "Reg No": reg_no_val,
-                                            "Student Name": student_name_val,
-                                            "Evaluation Criterion": raw_c_name,
-                                            "Likert Rating (1-4)": likert_val,
-                                            "Performance Level": r_label,
-                                            "Marks Awarded": awarded,
-                                            "Max Marks": max_m,
-                                            "Rubric Descriptor Matched": matched_desc,
-                                            "Specific AI Feedback": c_fb
-                                        })
-                                        
-                                    row_dict["AI Score"] = float(ev['ai_total_score'])
-                                    row_dict["Final Score"] = float(ev['final_total_score'])
-                                    row_dict["Feedback"] = ev['overall_feedback']
-                                    eval_df_data.append(row_dict)
+                                        "Evaluation Criterion": raw_c_name,
+                                        "Likert Rating (1-4)": likert_val,
+                                        "Performance Level": r_label,
+                                        "Marks Awarded": awarded,
+                                        "Max Marks": max_m,
+                                        "Rubric Descriptor Matched": matched_desc,
+                                        "Specific AI Feedback": c_fb
+                                    })
                                     
-                            if eval_df_data:
-                                all_criterion_cols = ordered_criterion_cols + extra_criterion_cols
-                                ordered_df_cols = ["sub_id", "Reg No", "Student Name"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
-                                df_evals = pd.DataFrame(eval_df_data)
-                                for col in ordered_df_cols:
-                                    if col not in df_evals.columns:
-                                        df_evals[col] = 0.0
-                                df_evals = df_evals[ordered_df_cols]
+                                row_dict["AI Score"] = float(ev['ai_total_score'])
+                                row_dict["Final Score"] = float(ev['final_total_score'])
+                                row_dict["Feedback"] = ev['overall_feedback']
+                            else:
+                                row_dict["AI Score"] = 0.0
+                                row_dict["Final Score"] = 0.0
+                                row_dict["Feedback"] = "⏳ Not graded yet — click 'Run AI Grading' above."
                                 
-                                st.markdown("### Edit Final Scores & Review Criterion Breakdown")
-                                col_cfg = {
-                                    "sub_id": None,
-                                    "Reg No": st.column_config.TextColumn(disabled=True),
-                                    "Student Name": st.column_config.TextColumn(disabled=True),
-                                    "AI Score": st.column_config.NumberColumn(disabled=True),
-                                    "Final Score": st.column_config.NumberColumn(
-                                        "Final Score (Editable)",
-                                        min_value=0.0,
-                                        max_value=float(active_total_marks),
-                                        step=0.5
-                                    ),
-                                }
-                                for c_col in all_criterion_cols:
-                                    col_cfg[c_col] = st.column_config.NumberColumn(c_col, disabled=True)
-                                
-                                edited_df = st.data_editor(
-                                    df_evals,
-                                    column_config=col_cfg,
-                                    hide_index=True,
-                                    use_container_width=True
-                                )
-                                
-                                if st.button("💾 Save Score Overrides"):
-                                    for index, row in edited_df.iterrows():
+                            eval_df_data.append(row_dict)
+                            
+                        if eval_df_data:
+                            all_criterion_cols = ordered_criterion_cols + extra_criterion_cols
+                            ordered_df_cols = ["sub_id", "Reg No", "Student Name", "Status"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
+                            df_evals = pd.DataFrame(eval_df_data)
+                            for col in ordered_df_cols:
+                                if col not in df_evals.columns:
+                                    df_evals[col] = 0.0
+                            df_evals = df_evals[ordered_df_cols]
+                            
+                            st.markdown("### Edit Final Scores & Review Criterion Breakdown")
+                            col_cfg = {
+                                "sub_id": None,
+                                "Reg No": st.column_config.TextColumn(disabled=True),
+                                "Student Name": st.column_config.TextColumn(disabled=True),
+                                "Status": st.column_config.TextColumn(disabled=True),
+                                "AI Score": st.column_config.NumberColumn(disabled=True),
+                                "Final Score": st.column_config.NumberColumn(
+                                    "Final Score (Editable)",
+                                    min_value=0.0,
+                                    max_value=float(active_total_marks),
+                                    step=0.5
+                                ),
+                            }
+                            for c_col in all_criterion_cols:
+                                col_cfg[c_col] = st.column_config.NumberColumn(c_col, disabled=True)
+                            
+                            edited_df = st.data_editor(
+                                df_evals,
+                                column_config=col_cfg,
+                                hide_index=True,
+                                use_container_width=True
+                            )
+                            
+                            if st.button("💾 Save Score Overrides"):
+                                for index, row in edited_df.iterrows():
+                                    if row['sub_id'] in evals_map:
                                         supabase.table("evaluations").update({
                                             "final_total_score": row['Final Score']
                                         }).eq("sub_id", row['sub_id']).execute()
-                                    st.success("Scores updated successfully!")
-                                    st.rerun()
-                                    
-                                st.markdown("---")
-                                st.markdown("### View Student Likert Breakdown (4 = Excellent to 1 = Needs Improvement)")
+                                st.success("Scores updated successfully!")
+                                st.rerun()
+                                
+                            st.markdown("---")
+                            st.markdown("### View Student Likert Breakdown (4 = Excellent to 1 = Needs Improvement)")
+                            if detailed_feedback_rows:
+                                st.dataframe(pd.DataFrame(detailed_feedback_rows), use_container_width=True, hide_index=True)
+                            
+                            st.markdown("---")
+                            st.markdown("### Export Master Gradebook & Likert Feedback (.xlsx)")
+                            
+                            excel_buffer = io.BytesIO()
+                            export_cols = ["Reg No", "Student Name", "Status"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
+                            df_export = edited_df[export_cols]
+                            
+                            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                sheet_1_name = f"{selected_c_code}_Assmt{exp_info['exp_number']}"[:31]
+                                df_export.to_excel(writer, index=False, sheet_name=sheet_1_name)
+                                
                                 if detailed_feedback_rows:
-                                    st.dataframe(pd.DataFrame(detailed_feedback_rows), use_container_width=True, hide_index=True)
-                                
-                                st.markdown("---")
-                                st.markdown("### Export Master Gradebook & Likert Feedback (.xlsx)")
-                                
-                                excel_buffer = io.BytesIO()
-                                export_cols = ["Reg No", "Student Name"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
-                                df_export = edited_df[export_cols]
-                                
-                                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                                    sheet_1_name = f"{selected_c_code}_Assmt{exp_info['exp_number']}"[:31]
-                                    df_export.to_excel(writer, index=False, sheet_name=sheet_1_name)
+                                    df_detailed = pd.DataFrame(detailed_feedback_rows)
+                                    df_detailed.to_excel(writer, index=False, sheet_name="Detailed_Likert_Rubric")
                                     
-                                    if detailed_feedback_rows:
-                                        df_detailed = pd.DataFrame(detailed_feedback_rows)
-                                        df_detailed.to_excel(writer, index=False, sheet_name="Detailed_Likert_Rubric")
-                                        
-                                excel_buffer.seek(0)
-                                
-                                st.download_button(
-                                    label="📥 Download Master Excel Grade Sheet & Likert Breakdown (.xlsx)",
-                                    data=excel_buffer,
-                                    file_name=f"{selected_c_code}_Assessment_{exp_info['exp_number']}_Likert_Grades.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                )
+                            excel_buffer.seek(0)
+                            
+                            st.download_button(
+                                label="📥 Download Master Excel Grade Sheet & Likert Breakdown (.xlsx)",
+                                data=excel_buffer,
+                                file_name=f"{selected_c_code}_Assessment_{exp_info['exp_number']}_Likert_Grades.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
                     else:
                         st.info("No student submissions found for this assessment yet.")
                 else:
