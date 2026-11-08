@@ -9,6 +9,8 @@ import pandas as pd
 import time
 import hashlib
 import urllib.parse
+import difflib
+import re
 from datetime import datetime, timezone, timedelta
 from collections import Counter
 from google import genai
@@ -189,7 +191,7 @@ DEFAULT_DESIGN_LIKERT_RUBRIC = [
 ]
 
 # ==========================================
-# HELPER FUNCTIONS: AUTH, RUBRIC CSV, TIMERS, DRIVE & GEMINI
+# HELPER FUNCTIONS: AUTH, RUBRIC CSV, INTEGRITY, TIMERS, DRIVE & GEMINI
 # ==========================================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.strip().encode("utf-8")).hexdigest()
@@ -242,6 +244,151 @@ def activate_slide_with_timer(course_id: str, poll_id: str, duration_sec: int):
         "timer_seconds": int(duration_sec),
         "timer_ends_at": ends_iso
     }).eq("poll_id", poll_id).execute()
+
+def normalize_text_for_similarity(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", str(text).lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+def compute_pairwise_similarity(text_a: str, text_b: str) -> float:
+    """Computes hybrid similarity (3-word shingle Jaccard + SequenceMatcher) between two student fingerprints."""
+    norm_a = normalize_text_for_similarity(text_a)
+    norm_b = normalize_text_for_similarity(text_b)
+    if len(norm_a) < 35 or len(norm_b) < 35:
+        return 0.0
+    words_a = norm_a.split()
+    words_b = norm_b.split()
+    if len(words_a) < 6 or len(words_b) < 6:
+        return 0.0
+    shingles_a = {" ".join(words_a[i:i+3]) for i in range(len(words_a) - 2)}
+    shingles_b = {" ".join(words_b[i:i+3]) for i in range(len(words_b) - 2)}
+    union_len = len(shingles_a | shingles_b)
+    jaccard = (len(shingles_a & shingles_b) / union_len) if union_len > 0 else 0.0
+    seq_ratio = difflib.SequenceMatcher(None, norm_a[:4000], norm_b[:4000]).ratio()
+    return round(max(jaccard, seq_ratio) * 100.0, 1)
+
+def format_ai_risk_badge(ai_pct: float) -> str:
+    if ai_pct >= 70:
+        return f"🔴 High ({int(ai_pct)}%)"
+    elif ai_pct >= 40:
+        return f"🟡 Medium ({int(ai_pct)}%)"
+    return f"🟢 Low ({int(ai_pct)}%)"
+
+def format_similarity_badge(sim_pct: float, matched_reg: str) -> str:
+    if sim_pct >= 75 and matched_reg:
+        return f"🚨 {int(sim_pct)}% (Match: {matched_reg})"
+    elif sim_pct >= 50 and matched_reg:
+        return f"🟡 {int(sim_pct)}% (Match: {matched_reg})"
+    return f"🟢 {int(sim_pct)}% (Unique)"
+
+def save_evaluation_record(sub_id: str, criteria_scores, ai_score: float, final_score: float, overall_fb: str, integrity_dict: dict):
+    """Safely saves evaluation and integrity data to Supabase, with automatic fallback if integrity_json column is absent."""
+    payload = {
+        "sub_id": sub_id,
+        "criteria_scores_json": criteria_scores,
+        "ai_total_score": ai_score,
+        "final_total_score": final_score,
+        "overall_feedback": overall_fb,
+        "integrity_json": integrity_dict
+    }
+    try:
+        supabase.table("evaluations").upsert(payload, on_conflict="sub_id").execute()
+    except Exception:
+        # Fallback: attach integrity_dict to first criterion metadata if SQL column wasn't added yet
+        if criteria_scores and isinstance(criteria_scores, list):
+            criteria_scores[0]["_integrity_meta"] = integrity_dict
+        payload.pop("integrity_json", None)
+        supabase.table("evaluations").upsert(payload, on_conflict="sub_id").execute()
+
+def extract_integrity_from_ev(ev_row: dict) -> dict:
+    """Retrieves integrity metadata from either integrity_json column or fallback criterion metadata."""
+    if not ev_row:
+        return {}
+    integ = ev_row.get("integrity_json")
+    if isinstance(integ, dict) and integ:
+        return integ
+    crit_list = ev_row.get("criteria_scores_json") or []
+    if crit_list and isinstance(crit_list[0], dict) and "_integrity_meta" in crit_list[0]:
+        return crit_list[0].get("_integrity_meta") or {}
+    return {}
+
+def run_cross_student_collusion_pass(submissions_list, evals_map_dict, apply_auto_penalty: bool):
+    """Compares all graded manuals in an assessment for exact file hash or narrative copy-pasting."""
+    records = []
+    for sub in submissions_list:
+        s_id = sub["sub_id"]
+        ev = evals_map_dict.get(s_id)
+        if not ev:
+            continue
+        integ = extract_integrity_from_ev(ev)
+        records.append({
+            "sub_id": s_id,
+            "reg_no": sub["reg_no"],
+            "student_name": sub["student_name"],
+            "ev": ev,
+            "integ": integ,
+            "fingerprint": str(integ.get("student_unique_fingerprint", "")),
+            "pdf_sha256": str(integ.get("pdf_sha256", ""))
+        })
+        
+    for i, rec_a in enumerate(records):
+        max_sim = 0.0
+        best_match_reg = ""
+        exact_file_match = False
+        for j, rec_b in enumerate(records):
+            if i == j:
+                continue
+            if rec_a["pdf_sha256"] and rec_a["pdf_sha256"] == rec_b["pdf_sha256"]:
+                sim = 100.0
+                exact_file_match = True
+            else:
+                sim = compute_pairwise_similarity(rec_a["fingerprint"], rec_b["fingerprint"])
+            if sim > max_sim:
+                max_sim = sim
+                best_match_reg = rec_b["reg_no"]
+                
+        integ = rec_a["integ"]
+        integ["similarity_score"] = round(max_sim, 1)
+        integ["similarity_match_reg"] = best_match_reg
+        integ["exact_file_duplicate"] = exact_file_match
+        
+        ev = rec_a["ev"]
+        raw_ai_score = float(ev.get("ai_total_score", 0.0))
+        base_fb = str(ev.get("overall_feedback", "")).split(" | 🚨 [AUTO-PENALTY")[0].split(" | ⚠️ [INTEGRITY FLAG")[0]
+        
+        ai_prob = float(integ.get("ai_Generation_probability", 0.0))
+        ai_reason = str(integ.get("ai_forensic_summary", "Checked."))
+        
+        if max_sim >= 75.0 and best_match_reg:
+            match_type = "Exact duplicate PDF file" if exact_file_match else f"{int(max_sim)}% text/calculation match"
+            if apply_auto_penalty:
+                penalized_score = round(raw_ai_score * 0.5, 2)
+                updated_fb = f"{base_fb} | 🚨 [AUTO-PENALTY: 50% deduction applied for high copy-paste collusion ({match_type} with {best_match_reg})]"
+                integ["penalty_applied"] = True
+            else:
+                penalized_score = float(ev.get("final_total_score", raw_ai_score))
+                updated_fb = f"{base_fb} | ⚠️ [INTEGRITY FLAG: {match_type} with {best_match_reg}]"
+                integ["penalty_applied"] = False
+        else:
+            penalized_score = raw_ai_score if apply_auto_penalty else float(ev.get("final_total_score", raw_ai_score))
+            updated_fb = base_fb
+            integ["penalty_applied"] = bool(apply_auto_penalty and ai_prob >= 70.0)
+            
+        integ["audit_summary"] = (
+            f"AI Check: {ai_reason} | "
+            f"Classmate Similarity: {int(max_sim)}%"
+            + (f" (closest: {best_match_reg})" if best_match_reg else "")
+        )
+        
+        save_evaluation_record(
+            sub_id=rec_a["sub_id"],
+            criteria_scores=ev.get("criteria_scores_json") or [],
+            ai_score=raw_ai_score,
+            final_score=penalized_score,
+            overall_fb=updated_fb,
+            integrity_dict=integ
+        )
 
 def parse_uploaded_rubric_file(uploaded_file):
     """Reads an uploaded CSV or Excel rubric file and normalizes column headers."""
@@ -435,13 +582,19 @@ def download_file_bytes_from_drive(target_ref):
     fh.seek(0)
     return fh.read()
 
-def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title, exp_guidelines, total_marks, is_combined=False):
+def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title, exp_guidelines, total_marks, is_combined=False, apply_ai_penalty=False):
     num_criteria = len(rubric_json)
     task_desc = (
         "This is a COMPREHENSIVE or COMBINED lab manual/report (containing multiple experiments or a full Design Report) compiled into a single PDF. "
         "Carefully inspect ALL pages and experiments across the entire PDF document, evaluate the student's work against EVERY SINGLE criterion in the rubric, and provide a complete breakdown."
         if is_combined else 
         "Thoroughly inspect all pages of the attached student lab report PDF (reading observation tables, formulas, calculations, figures, and discussion) and evaluate against EVERY SINGLE criterion in the 4-point Likert scale rubric."
+    )
+
+    penalty_instruction = (
+        "ACTIVE AUTO-PENALTY MODE: If you detect that a narrative section (e.g., Theory, Precautions, Environmental Significance, Conclusion) is generically AI-generated (ChatGPT/LLM boilerplate) and fails to reference the student's actual experimental numbers from their Observation/Calculation tables, you MUST cap that criterion at `likert_rating: 1` ('1 - Needs Improvement') and explicitly state '[AI/Generic Content Penalty]' in its feedback."
+        if apply_ai_penalty else
+        "FLAG-ONLY MODE: Grade the technical content fairly according to the rubric descriptors, and report any AI-generation or copy-paste indicators inside the `ai_generation_probability` and `ai_forensic_summary` fields so the instructor can review them."
     )
 
     prompt = f"""
@@ -455,18 +608,17 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
     Here is the 4-Point Likert Scale Analytic Rubric containing {num_criteria} required criteria (4 = Excellent, 3 = Proficient, 2 = Developing, 1 = Needs Improvement):
     {json.dumps(rubric_json, indent=2)}
     
-    CRITICAL SCORING INSTRUCTIONS:
+    CRITICAL SCORING & ACADEMIC INTEGRITY FORENSICS INSTRUCTIONS:
     1. {task_desc}
     2. Your `criteria_scores` array MUST contain EXACTLY {num_criteria} items—one for each criterion in the rubric above, using the exact "criterion" names provided. NEVER skip, merge, or omit any criterion.
-    3. For each criterion, compare the student's work to `level_4`, `level_3`, `level_2`, and `level_1`.
-    4. Assign a `likert_rating` (integer 4, 3, 2, or 1) and the corresponding `rating_label`:
-       - "4 - Excellent"
-       - "3 - Proficient"
-       - "2 - Developing"
-       - "1 - Needs Improvement"
-    5. Calculate `marks_awarded` as: `(likert_rating / 4.0) * max_marks`.
-    6. In `feedback`, clearly state WHY the student received that Likert level.
-    7. Ensure `ai_total_score` equals the exact sum of `marks_awarded` across all {num_criteria} criteria.
+    3. For each criterion, compare the student's work to `level_4`, `level_3`, `level_2`, and `level_1`, assign a `likert_rating` (4, 3, 2, or 1), and compute `marks_awarded` = `(likert_rating / 4.0) * max_marks`.
+    4. PERFORM AI & COPY-PASTE FORENSICS:
+       - Check whether the student's Discussion, Environmental Significance, and Conclusion cite the actual numerical results from their Observation Tables and Calculations, or if they read like a generic ChatGPT essay disconnected from their lab data.
+       - Check for LLM linguistic footprints, fabricated intermediate calculation steps, or abrupt font/formatting paste blocks.
+       - Estimate `ai_generation_probability` (0 to 100) and write a concise 1-sentence `ai_forensic_summary`.
+       - {penalty_instruction}
+    5. EXTRACT VERBATIM FINGERPRINT FOR CROSS-STUDENT COLLUSION CHECK:
+       - In `student_unique_fingerprint`, copy verbatim 250 to 450 words of the student's actual written text from their Theory, Calculations, Precautions, Environmental Significance, and Conclusion sections (plus their calculated numerical results). Do NOT summarize—extract their exact words and numbers so Python can compare classmates for copy-pasting.
     
     Return strictly valid JSON with this exact structure:
     {{
@@ -481,7 +633,10 @@ def evaluate_report_with_gemini(pdf_bytes, rubric_json, course_title, exp_title,
         }}
       ],
       "ai_total_score": 32.0,
-      "overall_feedback": "Summary statement on the student's performance across the manual/report."
+      "overall_feedback": "Summary statement on the student's performance across the manual/report.",
+      "ai_generation_probability": 15,
+      "ai_forensic_summary": "Conclusion and environmental significance cite actual measured pH and alkalinity values.",
+      "student_unique_fingerprint": "Verbatim text extracted from student's theory, calculations, environmental significance, and conclusion..."
     }}
     """
     
@@ -1316,10 +1471,10 @@ elif portal_mode == "Instructor / Admin Login":
                 st.info("Please set up a course first.")
 
         # ==========================================
-        # SECTION 5: GRADING & EXPORT (FULL INCREMENTAL + ALL STUDENTS)
+        # SECTION 5: GRADING, AI/COPY-PASTE DETECTION & EXPORT
         # ==========================================
         elif chosen_tab == "📊 Grading & Export":
-            st.subheader("Batch AI Grading Engine & Likert Scale Gradebook")
+            st.subheader("Batch AI Grading Engine, AI/Copy-Paste Forensics & Gradebook")
             my_courses = get_accessible_courses()
             
             if my_courses:
@@ -1359,23 +1514,55 @@ elif portal_mode == "Instructor / Admin Login":
                     m_col3.metric("⏳ Pending / Needs AI Grading", len(pending_subs))
                     
                     if submissions:
-                        only_ungraded = st.checkbox(
-                            "⚡ Grade ONLY Pending / Un-evaluated Manuals (Recommended — skips already-graded reports to avoid API quota limits)",
-                            value=True
-                        )
+                        chk_col1, chk_col2 = st.columns(2)
+                        with chk_col1:
+                            only_ungraded = st.checkbox(
+                                "⚡ Grade ONLY Pending / Un-evaluated Manuals (Skips already-graded reports)",
+                                value=True
+                            )
+                        with chk_col2:
+                            apply_integrity_penalty = st.checkbox(
+                                "🛡️ Apply Automatic Penalty for High AI (>=70%) or Copy-Paste Collusion (>=75%)",
+                                value=False,
+                                help="When UNCHECKED, the system only flags AI Risk % and Copy-Paste similarity in the table. When CHECKED, generic AI sections are capped at Level 1 and reports with >=75% classmate similarity receive a 50% score deduction."
+                            )
+                            
                         target_queue = pending_subs if only_ungraded else submissions
                         
-                        if st.button(f"🚀 Run AI Grading ({len(target_queue)} Manuals in Queue)", type="primary", key="btn_run_batch_grading"):
+                        btn_g1, btn_g2 = st.columns([2, 1])
+                        with btn_g1:
+                            run_batch_clicked = st.button(
+                                f"🚀 Run AI Grading & Integrity Forensics ({len(target_queue)} Manuals in Queue)",
+                                type="primary",
+                                use_container_width=True,
+                                key="btn_run_batch_grading"
+                            )
+                        with btn_g2:
+                            rerun_collusion_clicked = st.button(
+                                "🔍 Re-Scan Class Copy-Paste Similarity & Apply Toggle Rule",
+                                use_container_width=True,
+                                key="btn_rescan_similarity"
+                            )
+                            
+                        if rerun_collusion_clicked:
+                            with st.spinner("Comparing all graded manuals across the class for copy-pasting and applying toggle rule..."):
+                                run_cross_student_collusion_pass(submissions, evals_map, apply_integrity_penalty)
+                                st.success("✅ Cross-student similarity scan and penalty rules updated!")
+                                time.sleep(1)
+                                st.rerun()
+                                
+                        if run_batch_clicked:
                             if not target_queue:
-                                st.info("All submitted manuals are already graded! Uncheck the box above if you wish to re-grade all from scratch.")
+                                st.info("All submitted manuals are already graded! Click '🔍 Re-Scan Class Copy-Paste Similarity' to update flags, or uncheck 'Grade ONLY Pending' to re-grade all from scratch.")
                             else:
                                 progress_bar = st.progress(0)
                                 status_box = st.empty()
                                 
                                 for idx, sub in enumerate(target_queue):
-                                    status_box.info(f"⏳ Grading ({idx+1}/{len(target_queue)}): **{sub['student_name']}** (`{sub['reg_no']}`)...")
+                                    status_box.info(f"⏳ Grading & Running Forensics ({idx+1}/{len(target_queue)}): **{sub['student_name']}** (`{sub['reg_no']}`)...")
                                     try:
                                         pdf_bytes = download_file_bytes_from_drive(sub[COL_DRIVE_FILE])
+                                        pdf_hash = hashlib.sha256(pdf_bytes).hexdigest()
                                         
                                         eval_result = evaluate_report_with_gemini(
                                             pdf_bytes=pdf_bytes,
@@ -1384,16 +1571,28 @@ elif portal_mode == "Instructor / Admin Login":
                                             exp_title=exp_info['exp_title'],
                                             exp_guidelines=exp_info['exp_guidelines'],
                                             total_marks=active_total_marks,
-                                            is_combined=exp_info.get('is_combined', False)
+                                            is_combined=exp_info.get('is_combined', False),
+                                            apply_ai_penalty=apply_integrity_penalty
                                         )
                                         
-                                        supabase.table("evaluations").upsert({
-                                            "sub_id": sub['sub_id'],
-                                            "criteria_scores_json": eval_result['criteria_scores'],
-                                            "ai_total_score": eval_result['ai_total_score'],
-                                            "final_total_score": eval_result['ai_total_score'],
-                                            "overall_feedback": eval_result['overall_feedback']
-                                        }, on_conflict="sub_id").execute()
+                                        integrity_data = {
+                                            "ai_generation_probability": float(eval_result.get("ai_generation_probability", 10)),
+                                            "ai_forensic_summary": str(eval_result.get("ai_forensic_summary", "Evaluated.")),
+                                            "student_unique_fingerprint": str(eval_result.get("student_unique_fingerprint", "")),
+                                            "pdf_sha256": pdf_hash,
+                                            "similarity_score": 0.0,
+                                            "similarity_match_reg": "",
+                                            "penalty_applied": bool(apply_integrity_penalty and float(eval_result.get("ai_generation_probability", 0)) >= 70)
+                                        }
+                                        
+                                        save_evaluation_record(
+                                            sub_id=sub['sub_id'],
+                                            criteria_scores=eval_result['criteria_scores'],
+                                            ai_score=eval_result['ai_total_score'],
+                                            final_score=eval_result['ai_total_score'],
+                                            overall_fb=eval_result['overall_feedback'],
+                                            integrity_dict=integrity_data
+                                        )
                                         
                                         supabase.table("submissions").update({"status": "graded"}).eq("sub_id", sub['sub_id']).execute()
                                         st.toast(f"✅ Graded {sub['reg_no']}: {eval_result['ai_total_score']}/{active_total_marks}")
@@ -1406,12 +1605,18 @@ elif portal_mode == "Instructor / Admin Login":
                                     
                                     progress_bar.progress((idx + 1) / len(target_queue))
                                     
-                                status_box.success("✅ Batch grading run completed!")
+                                # Refresh evaluations map and run cross-student copy-paste comparison across all graded reports
+                                status_box.info("🔍 Running cross-student copy-paste & duplicate file comparison across all manuals...")
+                                refreshed_evals = supabase.table("evaluations").select("*").in_("sub_id", sub_ids).execute().data or []
+                                refreshed_map = {e["sub_id"]: e for e in refreshed_evals}
+                                run_cross_student_collusion_pass(submissions, refreshed_map, apply_integrity_penalty)
+                                
+                                status_box.success("✅ Batch grading and cross-student integrity audit completed!")
                                 time.sleep(1)
                                 st.rerun()
                                 
                         st.markdown("---")
-                        st.subheader(f"Graded Analysis & Criterion-Wise Likert Review (All {len(submissions)} Submissions)")
+                        st.subheader(f"Graded Analysis, Integrity Flags & Likert Review (All {len(submissions)} Submissions)")
                         
                         rubric_col_map = {}
                         rubric_lookup = {}
@@ -1432,12 +1637,20 @@ elif portal_mode == "Instructor / Admin Login":
                             reg_no_val = sub['reg_no']
                             student_name_val = sub['student_name']
                             ev = evals_map.get(s_id)
+                            integ = extract_integrity_from_ev(ev)
+                            
+                            ai_pct = float(integ.get("ai_generation_probability", 0.0))
+                            sim_pct = float(integ.get("similarity_score", 0.0))
+                            sim_match = str(integ.get("similarity_match_reg", ""))
+                            audit_notes = str(integ.get("audit_summary") or integ.get("ai_forensic_summary") or "—")
                             
                             row_dict = {
                                 "sub_id": s_id,
                                 "Reg No": reg_no_val,
                                 "Student Name": student_name_val,
-                                "Status": "✅ Graded" if ev else "⏳ Pending AI Grading"
+                                "Status": "✅ Graded" if ev else "⏳ Pending",
+                                "🤖 AI Risk": format_ai_risk_badge(ai_pct) if ev else "—",
+                                "📋 Copy-Paste Similarity": format_similarity_badge(sim_pct, sim_match) if ev else "—",
                             }
                             for col_label in ordered_criterion_cols:
                                 row_dict[col_label] = 0.0
@@ -1475,35 +1688,45 @@ elif portal_mode == "Instructor / Admin Login":
                                         "Performance Level": r_label,
                                         "Marks Awarded": awarded,
                                         "Max Marks": max_m,
+                                        "🤖 AI Risk": format_ai_risk_badge(ai_pct),
+                                        "📋 Classmate Similarity": format_similarity_badge(sim_pct, sim_match),
                                         "Rubric Descriptor Matched": matched_desc,
                                         "Specific AI Feedback": c_fb
                                     })
                                     
                                 row_dict["AI Score"] = float(ev['ai_total_score'])
                                 row_dict["Final Score"] = float(ev['final_total_score'])
+                                row_dict["🔍 Integrity Audit"] = audit_notes
                                 row_dict["Feedback"] = ev['overall_feedback']
                             else:
                                 row_dict["AI Score"] = 0.0
                                 row_dict["Final Score"] = 0.0
+                                row_dict["🔍 Integrity Audit"] = "Pending grading"
                                 row_dict["Feedback"] = "⏳ Not graded yet — click 'Run AI Grading' above."
                                 
                             eval_df_data.append(row_dict)
                             
                         if eval_df_data:
                             all_criterion_cols = ordered_criterion_cols + extra_criterion_cols
-                            ordered_df_cols = ["sub_id", "Reg No", "Student Name", "Status"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
+                            ordered_df_cols = (
+                                ["sub_id", "Reg No", "Student Name", "Status", "🤖 AI Risk", "📋 Copy-Paste Similarity"]
+                                + all_criterion_cols
+                                + ["AI Score", "Final Score", "🔍 Integrity Audit", "Feedback"]
+                            )
                             df_evals = pd.DataFrame(eval_df_data)
                             for col in ordered_df_cols:
                                 if col not in df_evals.columns:
                                     df_evals[col] = 0.0
                             df_evals = df_evals[ordered_df_cols]
                             
-                            st.markdown("### Edit Final Scores & Review Criterion Breakdown")
+                            st.markdown("### Edit Final Scores, Review Integrity Flags & Criterion Breakdown")
                             col_cfg = {
                                 "sub_id": None,
                                 "Reg No": st.column_config.TextColumn(disabled=True),
                                 "Student Name": st.column_config.TextColumn(disabled=True),
                                 "Status": st.column_config.TextColumn(disabled=True),
+                                "🤖 AI Risk": st.column_config.TextColumn(disabled=True),
+                                "📋 Copy-Paste Similarity": st.column_config.TextColumn(disabled=True),
                                 "AI Score": st.column_config.NumberColumn(disabled=True),
                                 "Final Score": st.column_config.NumberColumn(
                                     "Final Score (Editable)",
@@ -1511,6 +1734,7 @@ elif portal_mode == "Instructor / Admin Login":
                                     max_value=float(active_total_marks),
                                     step=0.5
                                 ),
+                                "🔍 Integrity Audit": st.column_config.TextColumn(disabled=True),
                             }
                             for c_col in all_criterion_cols:
                                 col_cfg[c_col] = st.column_config.NumberColumn(c_col, disabled=True)
@@ -1537,10 +1761,14 @@ elif portal_mode == "Instructor / Admin Login":
                                 st.dataframe(pd.DataFrame(detailed_feedback_rows), use_container_width=True, hide_index=True)
                             
                             st.markdown("---")
-                            st.markdown("### Export Master Gradebook & Likert Feedback (.xlsx)")
+                            st.markdown("### Export Master Gradebook, Integrity Audit & Likert Feedback (.xlsx)")
                             
                             excel_buffer = io.BytesIO()
-                            export_cols = ["Reg No", "Student Name", "Status"] + all_criterion_cols + ["AI Score", "Final Score", "Feedback"]
+                            export_cols = (
+                                ["Reg No", "Student Name", "Status", "🤖 AI Risk", "📋 Copy-Paste Similarity"]
+                                + all_criterion_cols
+                                + ["AI Score", "Final Score", "🔍 Integrity Audit", "Feedback"]
+                            )
                             df_export = edited_df[export_cols]
                             
                             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
@@ -1554,9 +1782,9 @@ elif portal_mode == "Instructor / Admin Login":
                             excel_buffer.seek(0)
                             
                             st.download_button(
-                                label="📥 Download Master Excel Grade Sheet & Likert Breakdown (.xlsx)",
+                                label="📥 Download Master Excel Grade Sheet, AI/Copy-Paste Audit & Likert Breakdown (.xlsx)",
                                 data=excel_buffer,
-                                file_name=f"{selected_c_code}_Assessment_{exp_info['exp_number']}_Likert_Grades.xlsx",
+                                file_name=f"{selected_c_code}_Assessment_{exp_info['exp_number']}_Likert_And_Integrity_Grades.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
                     else:
@@ -1716,9 +1944,8 @@ elif portal_mode == "Instructor / Admin Login":
                 if not session_slides:
                     st.info("No slides in this session yet. Expand the box above to add your first slide.")
                 else:
-                    # Determine current slide index in session_slides
                     slide_idx_key = f"slide_idx_{poll_course_id}_{selected_session}"
-                    active_in_session = [ idx for idx, s in enumerate(session_slides) if s.get("is_active") ]
+                    active_in_session = [idx for idx, s in enumerate(session_slides) if s.get("is_active")]
                     if slide_idx_key not in st.session_state:
                         st.session_state[slide_idx_key] = active_in_session[0] if active_in_session else 0
                     if st.session_state[slide_idx_key] >= len(session_slides):
@@ -1726,7 +1953,6 @@ elif portal_mode == "Instructor / Admin Login":
                         
                     curr_idx = st.session_state[slide_idx_key]
                     
-                    # Slide Selector & Prev / Next Navigation Bar
                     nav_c1, nav_c2, nav_c3 = st.columns([1, 3, 1])
                     with nav_c1:
                         if st.button("⬅️ Previous Slide", disabled=(curr_idx <= 0), use_container_width=True):
@@ -1772,7 +1998,6 @@ elif portal_mode == "Instructor / Admin Login":
                     if saved_timer_sec not in [30, 60, 90]:
                         saved_timer_sec = 30
 
-                    # Presenter Control Bar: Timer Duration, Launch/Close, Show/Hide Results, Reveal Answer, Delete
                     bar1, bar2, bar3, bar4, bar5 = st.columns([1.4, 1.4, 1.4, 1.4, 1])
                     with bar1:
                         live_timer_sel = st.selectbox(
@@ -1834,7 +2059,6 @@ elif portal_mode == "Instructor / Admin Login":
                             st.caption(f"🎯 **{fresh_poll.get('session_title', 'Session')} — Slide {slide_Position} of {total_slides_in_deck}**")
                             st.markdown(f"## 📢 {fresh_poll['question_text']}")
                             
-                            # Top Metrics & Live Countdown Bar
                             pm1, pm2, pm3 = st.columns(3)
                             pm1.metric("🔒 Locked Student Responses", f"{len(resps)} / {total_enrolled if total_enrolled else '?'}")
                             if fresh_poll.get("is_active") and rem_s is not None and rem_s > 0:
@@ -1844,7 +2068,6 @@ elif portal_mode == "Instructor / Admin Login":
                                 pm2.metric("⏱️ Voting Status", "🔴 Voting Closed / Time Up" if rem_s == 0 or not fresh_poll.get("is_active") else "🟢 Open")
                             pm3.metric("📊 Results Visibility", "📊 Shown on Projector" if fresh_poll.get("show_results") else "🙈 Hidden Until Clicked")
 
-                            # Show Large Readable Option Cards on Projector
                             if fresh_poll["poll_type"] in ["mcq", "quiz"]:
                                 render_projector_option_cards(
                                     fresh_poll.get("options_json") or [],
@@ -1853,7 +2076,6 @@ elif portal_mode == "Instructor / Admin Login":
                                 )
 
                             st.markdown("---")
-                            # Hidden vs Revealed Results Logic (Option 1)
                             if not fresh_poll.get("show_results"):
                                 st.info(
                                     "🙈 **Live Results Are Hidden:** Students are currently submitting answers independently. "
@@ -1888,7 +2110,7 @@ elif portal_mode == "Instructor / Admin Login":
 
                     render_live_projector_canvas(curr_poll_id, len(session_slides), st.session_state[slide_idx_key] + 1)
 
-                    # 5. FULL-ROSTER ATTENDANCE & QUESTION-BY-QUESTION EXCEL EXPORT (Option 4)
+                    # 5. FULL-ROSTER ATTENDANCE & QUESTION-BY-QUESTION EXCEL EXPORT
                     st.markdown("---")
                     st.subheader(f"📥 Full-Roster Attendance & Question-by-Question Report (`{selected_session}`)")
                     
@@ -1911,12 +2133,10 @@ elif portal_mode == "Instructor / Admin Login":
                             .data or []
                         )
                         
-                    # Map responses by (reg_no, poll_id)
                     resp_lookup = {}
                     for r in all_session_resps:
                         resp_lookup[(str(r["reg_no"]).strip().upper(), r["poll_id"])] = r
                         
-                    # Include any student who voted even if roster was updated later
                     roster_reg_set = {str(s["reg_no"]).strip().upper() for s in roster_students}
                     combined_students = list(roster_students)
                     for r in all_session_resps:
@@ -1988,7 +2208,6 @@ elif portal_mode == "Instructor / Admin Login":
                         
                     if summary_rows:
                         df_summary = pd.DataFrame(summary_rows)
-                        # Reorder columns cleanly: Reg No, Student Name, Attendance, Slides Answered, Q1..Qn, Total
                         fixed_first = ["Reg No", "Student Name", "Attendance", "Slides Answered"]
                         other_cols = [c for c in df_summary.columns if c not in fixed_first]
                         df_summary = df_summary[fixed_first + other_cols]
