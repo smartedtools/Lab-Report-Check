@@ -61,6 +61,9 @@ PARAM_FILE_KEY = "file" + "Id"
 ROOT_DRIVE_CONTAINER = st.secrets["google_drive"][DRIVE_ROOT_KEY]
 APP_PUBLIC_URL = "https://smartedtools-lab-report.streamlit.app"
 
+# 10-minute (600 seconds) auto-close grace window after the standard quiz timer ends
+AUTO_CLOSE_GRACE_SECONDS = 600
+
 # ==========================================
 # DEFAULT 4-POINT LIKERT SCALE RUBRIC TEMPLATES
 # ==========================================
@@ -212,7 +215,10 @@ def ensure_default_admin():
         pass
 
 def get_remaining_seconds(poll_obj):
-    """Calculates remaining countdown seconds from UTC timer_ends_at and auto-closes expired polls."""
+    """
+    Calculates remaining seconds until the global 10-minute auto-close cutoff (timer_ends_at)
+    and automatically closes the poll in Supabase once that window expires.
+    """
     ends_str = poll_obj.get("timer_ends_at")
     if not ends_str:
         return None
@@ -233,9 +239,94 @@ def get_remaining_seconds(poll_obj):
     except Exception:
         return None
 
+def get_student_individual_remaining_seconds(poll_obj, reg_no: str) -> int:
+    """
+    Starts and tracks an individual countdown timer (timer_seconds) for each student
+    from the moment they open the active slide, while respecting the global 10-minute auto-close window.
+    """
+    global_rem = get_remaining_seconds(poll_obj)
+    if global_rem is not None and global_rem <= 0:
+        return 0
+
+    p_id = str(poll_obj.get("poll_id", ""))
+    indiv_duration = int(poll_obj.get("timer_seconds") or 30)
+    now_utc = datetime.now(timezone.utc)
+
+    # Calculate when the instructor activated this slide so re-activated slides reset cleanly
+    slide_activated_at = None
+    ends_str = poll_obj.get("timer_ends_at")
+    if ends_str:
+        try:
+            ends_dt = datetime.fromisoformat(str(ends_str).replace("Z", "+00:00"))
+            if ends_dt.tzinfo is None:
+                ends_dt = ends_dt.replace(tzinfo=timezone.utc)
+            slide_activated_at = ends_dt - timedelta(seconds=(indiv_duration + AUTO_CLOSE_GRACE_SECONDS))
+        except Exception:
+            slide_activated_at = None
+
+    state_key = f"indiv_timer_start_{p_id}_{reg_no}"
+    started_dt = None
+
+    # 1. Check session_state cache first
+    if state_key in st.session_state:
+        try:
+            cached_dt = datetime.fromisoformat(str(st.session_state[state_key]).replace("Z", "+00:00"))
+            if cached_dt.tzinfo is None:
+                cached_dt = cached_dt.replace(tzinfo=timezone.utc)
+            if not slide_activated_at or cached_dt >= (slide_activated_at - timedelta(seconds=5)):
+                started_dt = cached_dt
+        except Exception:
+            started_dt = None
+
+    # 2. Check or record in Supabase quiz_sessions table (with safe fallback if table/columns differ)
+    if started_dt is None:
+        try:
+            q_res = (
+                supabase.table("quiz_sessions")
+                .select("started_at")
+                .eq("quiz_id", p_id)
+                .eq("student_id", reg_no)
+                .execute()
+            )
+            if q_res.data and q_res.data[0].get("started_at"):
+                db_dt = datetime.fromisoformat(str(q_res.data[0]["started_at"]).replace("Z", "+00:00"))
+                if db_dt.tzinfo is None:
+                    db_dt = db_dt.replace(tzinfo=timezone.utc)
+                if not slide_activated_at or db_dt >= (slide_activated_at - timedelta(seconds=5)):
+                    started_dt = db_dt
+        except Exception:
+            pass
+
+    # 3. First time this student opened this active question -> start their personal timer now
+    if started_dt is None:
+        started_dt = now_utc
+        try:
+            supabase.table("quiz_sessions").delete().eq("quiz_id", p_id).eq("student_id", reg_no).execute()
+            supabase.table("quiz_sessions").insert({
+                "quiz_id": p_id,
+                "student_id": reg_no,
+                "started_at": started_dt.isoformat()
+            }).execute()
+        except Exception:
+            pass
+
+    st.session_state[state_key] = started_dt.isoformat()
+
+    elapsed_sec = int((now_utc - started_dt).total_seconds())
+    indiv_rem = max(0, indiv_duration - elapsed_sec)
+
+    if global_rem is not None:
+        return min(indiv_rem, global_rem)
+    return indiv_rem
+
 def activate_slide_with_timer(course_id: str, poll_id: str, duration_sec: int):
-    """Closes any other active slide in the course and opens the target slide with a fresh countdown timer."""
-    ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=int(duration_sec))).isoformat()
+    """
+    Closes any other active slide in the course and opens the target slide.
+    Each student gets `duration_sec` individually, while the slide auto-closes
+    10 minutes (AUTO_CLOSE_GRACE_SECONDS) after `duration_sec` is over.
+    """
+    total_window_sec = int(duration_sec) + AUTO_CLOSE_GRACE_SECONDS
+    ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=total_window_sec)).isoformat()
     supabase.table("live_polls").update({"is_active": False}).eq("course_id", course_id).execute()
     supabase.table("live_polls").update({
         "is_active": True,
@@ -244,6 +335,10 @@ def activate_slide_with_timer(course_id: str, poll_id: str, duration_sec: int):
         "timer_seconds": int(duration_sec),
         "timer_ends_at": ends_iso
     }).eq("poll_id", poll_id).execute()
+    try:
+        supabase.table("quiz_sessions").delete().eq("quiz_id", str(poll_id)).execute()
+    except Exception:
+        pass
 
 def normalize_text_for_similarity(text: str) -> str:
     if not text:
@@ -357,7 +452,7 @@ def run_cross_student_collusion_pass(submissions_list, evals_map_dict, apply_aut
         raw_ai_score = float(ev.get("ai_total_score", 0.0))
         base_fb = str(ev.get("overall_feedback", "")).split(" | 🚨 [AUTO-PENALTY")[0].split(" | ⚠️ [INTEGRITY FLAG")[0]
         
-        ai_prob = float(integ.get("ai_Generation_probability", 0.0))
+        ai_prob = float(integ.get("ai_generation_probability", 0.0))
         ai_reason = str(integ.get("ai_forensic_summary", "Checked."))
         
         if max_sim >= 75.0 and best_match_reg:
@@ -854,7 +949,7 @@ if portal_mode == "Student Submission Portal":
 elif portal_mode == "🎯 Live Class Poll & Quiz":
     st.title("🎯 Live Class Poll, Word Cloud & Quiz")
     st.markdown(
-        "Verify your course enrollment once below. Your screen will **automatically sync with the classroom projector** as your instructor advances from slide to slide."
+        "Verify your course enrollment once below. Your screen will **automatically sync with the classroom projector** and start your **individual timer** as each question launches."
     )
     
     courses_res = supabase.table("courses").select("course_id, course_code, course_title").execute()
@@ -879,14 +974,14 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
         
         st.markdown("---")
         if 'verified_student' not in st.session_state or st.session_state['verified_student'].get('course_id') != course_id:
-            st.subheader("Step 1: Verify Roster Identity")
+            st.subheader("Step 1: Verify Roster Identity (Enter Waiting Lobby)")
             with st.form("poll_student_auth_form"):
                 col_a, col_b = st.columns(2)
                 with col_a:
                     input_reg = st.text_input("Registration Number (e.g., 2023-MS-EN-201)").strip().upper()
                 with col_b:
                     input_email = st.text_input("University Email").strip().lower()
-                verify_poll_btn = st.form_submit_button("🚀 Join Live Classroom Session", type="primary")
+                verify_poll_btn = st.form_submit_button("🚀 Join Live Classroom Lobby", type="primary")
                 
             if verify_poll_btn:
                 if not input_reg or not input_email:
@@ -902,7 +997,7 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
             student_info = st.session_state['verified_student']
             col_s_info, col_s_switch = st.columns([4, 1])
             with col_s_info:
-                st.success(f"🟢 Connected: **{student_info['student_name']}** (`{student_info['reg_no']}`) — Course: **{selected_course_obj['course_code']}**")
+                st.success(f"🟢 Connected in Lobby: **{student_info['student_name']}** (`{student_info['reg_no']}`) — Course: **{selected_course_obj['course_code']}**")
             with col_s_switch:
                 if st.button("Switch Student"):
                     st.session_state.pop('verified_student', None)
@@ -921,90 +1016,118 @@ elif portal_mode == "🎯 Live Class Poll & Quiz":
                 )
                 
                 if not active_polls:
-                    st.info("⏳ **Waiting for instructor...** No slide is currently open for voting. Keep this screen open—it will update automatically as soon as the next question launches!")
+                    st.info(
+                        "⏳ **Waiting Lobby:** You are connected and ready! No slide is currently open for voting. "
+                        "Keep this screen open—your personal timer will start automatically as soon as the instructor launches the question."
+                    )
                     return
                 
                 poll = active_polls[0]
                 p_id = poll['poll_id']
                 p_type = poll['poll_type']
-                rem_sec = get_remaining_seconds(poll)
-                
-                if rem_sec is not None and rem_sec <= 0:
-                    st.warning("⏰ **Time is up for this question!** Waiting for the instructor to advance to the next slide...")
+
+                # Check global 10-minute auto-close cutoff first
+                global_rem_sec = get_remaining_seconds(poll)
+                if global_rem_sec is not None and global_rem_sec <= 0:
+                    st.error("🔒 **This quiz window has automatically closed (10-minute post-quiz window ended).** Waiting for the instructor...")
                     return
-                
+
                 session_lbl = poll.get("session_title") or "Live Session"
                 slide_no = poll.get("slide_order") or 1
+                indiv_total_sec = int(poll.get("timer_seconds") or 30)
                 type_badge = {
                     "mcq": "📊 Live Multiple Choice Poll",
                     "quiz": f"🏆 Graded Quiz ({poll.get('marks', 1.0)} Marks)",
                     "wordcloud": "☁️ Live Word Cloud"
                 }.get(p_type, "📊 Poll")
-                
+
+                existing_vote = (
+                    supabase.table("poll_responses")
+                    .select("*")
+                    .eq("poll_id", p_id)
+                    .eq("reg_no", stu['reg_no'])
+                    .execute()
+                    .data
+                )
+
                 with st.container(border=True):
-                    top_c1, top_c2 = st.columns([3, 1])
-                    with top_c1:
-                        st.caption(f"📌 **{session_lbl} — Slide #{slide_no}** | {type_badge}")
-                    with top_c2:
-                        if rem_sec is not None:
-                            st.markdown(f"### ⏱️ `{rem_sec}s`")
-                            
-                    st.markdown(f"### {poll['question_text']}")
-                    
-                    existing_vote = (
-                        supabase.table("poll_responses")
-                        .select("*")
-                        .eq("poll_id", p_id)
-                        .eq("reg_no", stu['reg_no'])
-                        .execute()
-                        .data
-                    )
-                    
                     if existing_vote:
                         my_resp = existing_vote[0]
+                        st.caption(f"📌 **{session_lbl} — Slide #{slide_no}** | {type_badge}")
+                        st.markdown(f"### {poll['question_text']}")
                         st.success(
                             f"🔒 **Answer Locked:** You submitted **`{my_resp['response_text']}`**. "
-                            f"Wait for the instructor to advance to the next slide."
+                            f"Please wait in the lobby for the instructor to advance to the next slide."
                         )
                         if p_type == "quiz" and poll.get("reveal_answer"):
                             if my_resp.get("is_correct"):
                                 st.info(f"✅ **Correct!** Answer: `{poll['correct_answer']}` | Marks Earned: **{my_resp['marks_awarded']} / {poll['marks']}**")
                             else:
                                 st.warning(f"❌ **Incorrect.** Correct Answer: `{poll['correct_answer']}` | Marks Earned: **0 / {poll['marks']}**")
-                    else:
-                        with st.form(f"student_vote_form_{p_id}"):
-                            if p_type in ["mcq", "quiz"]:
-                                opts = poll.get("options_json") or []
-                                choice = st.radio("Select your answer (Strictly ONE attempt):", opts, index=None, key=f"stu_radio_{p_id}")
+                        return
+
+                    # Calculate individual remaining time for this specific student
+                    stu_rem_sec = get_student_individual_remaining_seconds(poll, stu['reg_no'])
+
+                    top_c1, top_c2 = st.columns([3, 1])
+                    with top_c1:
+                        st.caption(f"📌 **{session_lbl} — Slide #{slide_no}** | {type_badge}")
+                    with top_c2:
+                        st.markdown(f"### ⏱️ `{stu_rem_sec}s`")
+
+                    if indiv_total_sec > 0:
+                        st.progress(min(max(stu_rem_sec / float(indiv_total_sec), 0.0), 1.0))
+
+                    st.markdown(f"### {poll['question_text']}")
+
+                    if stu_rem_sec <= 0:
+                        st.warning(
+                            f"⏰ **Your individual time ({indiv_total_sec}s) is up for this question!** "
+                            "Waiting for the instructor to advance to the next slide..."
+                        )
+                        return
+
+                    with st.form(f"student_vote_form_{p_id}"):
+                        if p_type in ["mcq", "quiz"]:
+                            opts = poll.get("options_json") or []
+                            choice = st.radio("Select your answer (Strictly ONE attempt):", opts, index=None, key=f"stu_radio_{p_id}")
+                        else:
+                            choice = st.text_input("Enter your word or short phrase (max 25 chars):", max_chars=25, key=f"stu_wc_{p_id}").strip()
+                            
+                        submit_vote = st.form_submit_button("🔒 Submit & Lock Answer", type="primary")
+                        if submit_vote:
+                            latest_poll = supabase.table("live_polls").select("*").eq("poll_id", p_id).single().execute().data
+                            latest_global_rem = get_remaining_seconds(latest_poll)
+                            latest_stu_rem = get_student_individual_remaining_seconds(latest_poll, stu['reg_no'])
+                            # Allow 3-second network grace buffer on submit click
+                            if not latest_poll.get("is_active") or (latest_global_rem is not None and latest_global_rem <= 0) or (latest_stu_rem <= -3):
+                                st.error("⏰ Voting time for this question has expired!")
+                                st.rerun()
+                            elif not choice:
+                                st.error("Please select or type your response before submitting.")
                             else:
-                                choice = st.text_input("Enter your word or short phrase (max 25 chars):", max_chars=25, key=f"stu_wc_{p_id}").strip()
-                                
-                            submit_vote = st.form_submit_button("🔒 Submit & Lock Answer", type="primary")
-                            if submit_vote:
-                                latest_poll = supabase.table("live_polls").select("*").eq("poll_id", p_id).single().execute().data
-                                latest_rem = get_remaining_seconds(latest_poll)
-                                if not latest_poll.get("is_active") or (latest_rem is not None and latest_rem <= 0):
-                                    st.error("⏰ Voting for this slide has just closed!")
-                                    st.rerun()
-                                elif not choice:
-                                    st.error("Please select or type your response before submitting.")
-                                else:
-                                    recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", stu['reg_no']).execute().data
-                                    if not recheck:
-                                        is_corr = False
-                                        awarded = 0.0
-                                        if p_type == "quiz":
-                                            is_corr = (str(choice).strip() == str(latest_poll.get("correct_answer", "")).strip())
-                                            awarded = float(latest_poll.get("marks", 1.0)) if is_corr else 0.0
-                                        supabase.table("poll_responses").insert({
-                                            "poll_id": p_id,
-                                            "reg_no": stu['reg_no'],
-                                            "student_name": stu['student_name'],
-                                            "response_text": str(choice).strip(),
-                                            "is_correct": is_corr,
-                                            "marks_awarded": awarded
-                                        }).execute()
-                                    st.rerun()
+                                recheck = supabase.table("poll_responses").select("resp_id").eq("poll_id", p_id).eq("reg_no", stu['reg_no']).execute().data
+                                if not recheck:
+                                    is_corr = False
+                                    awarded = 0.0
+                                    if p_type == "quiz":
+                                        is_corr = (str(choice).strip() == str(latest_poll.get("correct_answer", "")).strip())
+                                        awarded = float(latest_poll.get("marks", 1.0)) if is_corr else 0.0
+                                    supabase.table("poll_responses").insert({
+                                        "poll_id": p_id,
+                                        "reg_no": stu['reg_no'],
+                                        "student_name": stu['student_name'],
+                                        "response_text": str(choice).strip(),
+                                        "is_correct": is_corr,
+                                        "marks_awarded": awarded
+                                    }).execute()
+                                    try:
+                                        supabase.table("quiz_sessions").update({
+                                            "submitted_at": datetime.now(timezone.utc).isoformat()
+                                        }).eq("quiz_id", str(p_id)).eq("student_id", stu['reg_no']).execute()
+                                    except Exception:
+                                        pass
+                                st.rerun()
 
             render_student_live_slide(course_id, selected_course_obj['course_code'], student_info)
 
@@ -1798,7 +1921,7 @@ elif portal_mode == "Instructor / Admin Login":
         # SECTION 6: MENTIMETER LIVE SLIDE DECK, QR CODE, TIMER & FULL-ROSTER EXCEL
         # ==========================================
         elif chosen_tab == "🎯 Live Polls & Quizzes":
-            st.subheader("🎯 Mentimeter Classroom Slide Deck, Live Timer & Roster Gradebook")
+            st.subheader("🎯 Mentimeter Classroom Slide Deck, Individual Student Timers & Roster Gradebook")
             my_courses = get_accessible_courses()
             
             if not my_courses:
@@ -1839,8 +1962,8 @@ elif portal_mode == "Instructor / Admin Login":
                     with qr_c2:
                         st.markdown(f"### Join Live Poll & Quiz: **{selected_poll_c_code}**")
                         st.markdown(f"1. Scan the QR code with your phone camera, **OR** open:\n   ### `{join_url}`")
-                        st.markdown("2. Enter your **Registration Number** and **University Email** once.")
-                        st.markdown("3. Keep your phone screen open—questions will advance automatically as the instructor clicks **Next Slide ➡️**.")
+                        st.markdown("2. Enter your **Registration Number** and **University Email** once to enter the **Waiting Lobby**.")
+                        st.markdown("3. Keep your phone screen open—your personal countdown timer starts automatically when each slide opens (with a **10-minute auto-close grace period** for late connections).")
 
                 # 2. ADD NEW SLIDE TO SESSION DECK
                 session_slides = [
@@ -1857,7 +1980,7 @@ elif portal_mode == "Instructor / Admin Login":
                         slide_no_input = st.number_input("Slide Order #", min_value=1, value=next_slide_num, step=1)
                     with sc3:
                         timer_choice_lbl = st.radio(
-                            "Countdown Timer",
+                            "Individual Student Timer (+ 10m Auto-Close)",
                             ["30 sec", "60 sec", "90 sec"],
                             index=0,
                             horizontal=True,
@@ -1917,7 +2040,8 @@ elif portal_mode == "Instructor / Admin Login":
                         else:
                             if launch_immediately:
                                 supabase.table("live_polls").update({"is_active": False}).eq("course_id", poll_course_id).execute()
-                                ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=timer_sec_val)).isoformat()
+                                total_window_sec = int(timer_sec_val) + AUTO_CLOSE_GRACE_SECONDS
+                                ends_iso = (datetime.now(timezone.utc) + timedelta(seconds=total_window_sec)).isoformat()
                             else:
                                 ends_iso = None
                                 
@@ -2004,7 +2128,7 @@ elif portal_mode == "Instructor / Admin Login":
                             "Timer Duration",
                             [30, 60, 90],
                             index=[30, 60, 90].index(saved_timer_sec),
-                            format_func=lambda x: f"⏱️ Timer: {x} sec",
+                            format_func=lambda x: f"⏱️ {x}s / student (+10m close)",
                             key=f"timer_sel_{curr_poll_id}",
                             label_visibility="collapsed"
                         )
@@ -2054,6 +2178,7 @@ elif portal_mode == "Instructor / Admin Login":
                         
                         rem_s = get_remaining_seconds(fresh_poll)
                         t_total = int(fresh_poll.get("timer_seconds") or 30)
+                        total_window = t_total + AUTO_CLOSE_GRACE_SECONDS
                         
                         with st.container(border=True):
                             st.caption(f"🎯 **{fresh_poll.get('session_title', 'Session')} — Slide {slide_Position} of {total_slides_in_deck}**")
@@ -2062,10 +2187,14 @@ elif portal_mode == "Instructor / Admin Login":
                             pm1, pm2, pm3 = st.columns(3)
                             pm1.metric("🔒 Locked Student Responses", f"{len(resps)} / {total_enrolled if total_enrolled else '?'}")
                             if fresh_poll.get("is_active") and rem_s is not None and rem_s > 0:
-                                pm2.metric("⏱️ Countdown Timer", f"{rem_s} sec remaining")
-                                st.progress(min(max(rem_s / float(t_total), 0.0), 1.0))
+                                mins_left, secs_left = divmod(rem_s, 60)
+                                pm2.metric(
+                                    f"⏱️ {t_total}s Per Student | Auto-Close Window",
+                                    f"{mins_left:02d}:{secs_left:02d} left"
+                                )
+                                st.progress(min(max(rem_s / float(total_window), 0.0), 1.0))
                             else:
-                                pm2.metric("⏱️ Voting Status", "🔴 Voting Closed / Time Up" if rem_s == 0 or not fresh_poll.get("is_active") else "🟢 Open")
+                                pm2.metric("⏱️ Voting Status", "🔴 Voting Closed / Auto-Closed" if rem_s == 0 or not fresh_poll.get("is_active") else "🟢 Open")
                             pm3.metric("📊 Results Visibility", "📊 Shown on Projector" if fresh_poll.get("show_results") else "🙈 Hidden Until Clicked")
 
                             if fresh_poll["poll_type"] in ["mcq", "quiz"]:
@@ -2078,7 +2207,8 @@ elif portal_mode == "Instructor / Admin Login":
                             st.markdown("---")
                             if not fresh_poll.get("show_results"):
                                 st.info(
-                                    "🙈 **Live Results Are Hidden:** Students are currently submitting answers independently. "
+                                    "🙈 **Live Results Are Hidden:** Students are currently submitting answers independently "
+                                    f"(each student gets **{t_total}s** upon joining; portal auto-closes **10 minutes** after timer ends). "
                                     "Click **📊 Show Results** above when you are ready to display the class distribution on the projector."
                                 )
                             else:
